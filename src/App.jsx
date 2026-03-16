@@ -39,7 +39,6 @@ function useRealtime(onChange) {
       ws = new WebSocket(WS_URL);
 
       ws.onopen = () => {
-        // Subscribe to postgres changes on each table
         TABLES.forEach(table => {
           ws.send(JSON.stringify({
             topic:   `realtime:public:${table}`,
@@ -55,7 +54,6 @@ function useRealtime(onChange) {
           }));
         });
 
-        // Supabase requires a heartbeat every 30 s or it drops the connection
         heartbeat = setInterval(() => {
           if (ws?.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
@@ -68,14 +66,13 @@ function useRealtime(onChange) {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          // postgres_changes = a row was inserted/updated/deleted — refresh
           if (msg.event === "postgres_changes") onChange();
-        } catch { /* ignore parse errors */ }
+        } catch { /* ignore */ }
       };
 
       ws.onclose = () => {
         clearInterval(heartbeat);
-        if (!dead) setTimeout(connect, 3000); // auto-reconnect
+        if (!dead) setTimeout(connect, 3000);
       };
 
       ws.onerror = () => ws.close();
@@ -90,6 +87,30 @@ function useRealtime(onChange) {
     };
   }, [onChange]);
 }
+
+// ── Live clock hook (ticks every 30s) ────────────────────────────────────────
+function useNow() {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, []);
+  return now;
+}
+
+// ── Timing helpers ────────────────────────────────────────────────────────────
+const fmtDuration = (minutes) => {
+  if (!minutes || !isFinite(minutes) || minutes < 0) return "—";
+  const h = Math.floor(minutes / 60);
+  const m = Math.round(minutes % 60);
+  if (h === 0) return `${m}m`;
+  return `${h}h ${m}m`;
+};
+
+const fmtTime = (isoString) => {
+  if (!isoString) return "—";
+  return new Date(isoString).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+};
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 const css = `
@@ -138,14 +159,14 @@ const DEPOT_ADDRESS = "11135 Newport Mill Rd, Kensington, MD 20895";
 const fullRouteUrl = (stops) => {
   if (!stops?.length) return "#";
   const origin = encodeURIComponent(DEPOT_ADDRESS);
-  const dest   = encodeURIComponent(DEPOT_ADDRESS);  // return to AEHS
+  const dest   = encodeURIComponent(DEPOT_ADDRESS);
   const waypts = stops.map(s => encodeURIComponent(s.address)).join("|");
   return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${dest}${waypts ? `&waypoints=${waypts}` : ""}`;
 };
 
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [view, setView]         = useState("login"); // login | manager | driver
+  const [view, setView]         = useState("login");
   const [driverRoute, setDriverRoute] = useState(null);
   const [driverPin, setDriverPin]     = useState("");
   const [pinError, setPinError]       = useState("");
@@ -154,7 +175,6 @@ export default function App() {
   const [allStops, setAllStops] = useState([]);
   const [loading, setLoading]   = useState(false);
 
-  // Check URL for driver route
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const routeId = params.get("route");
@@ -187,7 +207,6 @@ export default function App() {
         sbGet("pickup_orders", { select: "*", order: "name.asc" }),
         sbGet("stops",         { select: "route_id,status,bags" }),
       ]);
-      // Sort numerically: Truck 1 Trip 1, Truck 1 Trip 2, Truck 2 Trip 1 ...
       const parseVehicle = (v = "") => {
         const m = v.match(/(\d+)[^\d]+(\d+)/);
         return m ? [parseInt(m[1]), parseInt(m[2])] : [0, 0];
@@ -280,7 +299,6 @@ function LoginScreen({ onManager, pinError, loading }) {
 function openPrintWindow(routesList, stopsMatrix, appUrl) {
   const depot = "11135 Newport Mill Rd, Kensington, MD 20895";
 
-  // Sort numerically: Truck 1 Trip 1, Truck 1 Trip 2, Truck 2 Trip 1 ...
   const parseVehicle = (v = "") => {
     const m = v.match(/(\d+)[^\d]+(\d+)/);
     return m ? [parseInt(m[1]), parseInt(m[2])] : [0, 0];
@@ -359,8 +377,6 @@ function openPrintWindow(routesList, stopsMatrix, appUrl) {
     body { font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #111; }
     .page { page-break-after: always; display: flex; flex-direction: column; min-height: 9.5in; }
     .page:last-child { page-break-after: avoid; }
-
-    /* Header */
     .page-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
     .event-label { font-size: 8.5px; font-weight: 700; color: #1a6b3a; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 4px; }
     .route-name { font-size: 30px; font-weight: 900; line-height: 1.1; margin-bottom: 2px; }
@@ -368,12 +384,8 @@ function openPrintWindow(routesList, stopsMatrix, appUrl) {
     .stats span { font-size: 11px; border: 1px solid #ccc; border-radius: 12px; padding: 2px 10px; margin-right: 6px; color: #333; }
     .header-qr { text-align: center; flex-shrink: 0; }
     .qr-caption { font-size: 9px; color: #666; margin-top: 4px; }
-
-    /* Depot */
     .depot-row { background: #fffde7; border: 1px solid #ffe082; border-radius: 6px;
                  padding: 7px 12px; margin-bottom: 12px; font-size: 11px; color: #5a3e00; }
-
-    /* Table */
     table { width: 100%; border-collapse: collapse; font-size: 11px; }
     thead tr { background: #f5f5f5; }
     th { padding: 6px 8px; text-align: left; font-size: 9px; font-weight: 700; color: #888;
@@ -385,12 +397,8 @@ function openPrintWindow(routesList, stopsMatrix, appUrl) {
     .col-bags { width: 80px; color: #1a6b3a; }
     .col-instr { color: #333; }
     .phone { color: #555; font-size: 10px; }
-
-    /* Keys reminder */
     .keys-reminder { margin-top: 14px; text-align: center; color: #cc0000; font-weight: 700;
                      font-size: 14px; letter-spacing: 0.5px; }
-
-    /* Footer */
     .page-footer { margin-top: auto; padding-top: 10px; border-top: 1px solid #ddd;
                    display: flex; justify-content: space-between; font-size: 9px; color: #aaa; }
   </style>
@@ -409,16 +417,17 @@ function openPrintWindow(routesList, stopsMatrix, appUrl) {
 // ── Manager Dashboard ─────────────────────────────────────────────────────────
 function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
   const [activeShift, setActiveShift] = useState(0);
-  const [activeTab,   setActiveTab]   = useState("routes"); // routes | pickups | qr
+  const [activeTab,   setActiveTab]   = useState("routes");
   const [editingRoute, setEditingRoute] = useState(null);
   const [driverName, setDriverName]     = useState("");
   const [saving, setSaving]             = useState(false);
   const [qrRoute, setQrRoute]           = useState(null);
   const [printing, setPrinting]         = useState(false);
 
+  const now = useNow();
+
   const shiftRoutes = routes.filter(r => r.shift_num === activeShift + 1);
 
-  // Build a per-route stop lookup for cards
   const stopsByRoute = allStops.reduce((acc, s) => {
     if (!acc[s.route_id]) acc[s.route_id] = [];
     acc[s.route_id].push(s);
@@ -435,7 +444,7 @@ function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
   const totalHouseholds = totalStops + pickups.length;
   const totalMiles      = routes.reduce((a, r) => a + (r.total_miles || 0), 0);
 
-  // Stats — Progress (from actual delivered stop statuses, not just completed routes)
+  // Stats — Progress
   const deliveredStops  = allStops.filter(s => s.status === "delivered" || s.status === "skipped");
   const doneStops       = deliveredStops.length;
   const doneBags        = allStops.filter(s => s.status === "delivered").reduce((a, s) => a + (s.bags || 0), 0)
@@ -444,6 +453,21 @@ function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
   const doneHouseholds  = doneStops + donePickups;
   const doneRoutes      = routes.filter(r => r.status === "complete");
   const doneMiles       = doneRoutes.reduce((a, r) => a + (r.total_miles || 0), 0);
+
+  // ── Global timing ──────────────────────────────────────────────────────────
+  const startedRoutes = routes.filter(r => r.started_at);
+  const firstStartedAt = startedRoutes.length
+    ? new Date(Math.min(...startedRoutes.map(r => new Date(r.started_at).getTime())))
+    : null;
+
+  const globalElapsedMin = firstStartedAt ? (now - firstStartedAt.getTime()) / 60000 : 0;
+  const globalRate = globalElapsedMin > 0 && doneStops > 0
+    ? doneStops / globalElapsedMin   // stops per minute
+    : 0;
+  const globalEstTotalMin = globalRate > 0 ? totalHouseholds / globalRate : 0;
+  const globalEstRemainingMin = globalRate > 0
+    ? Math.max(0, (totalHouseholds - doneHouseholds) / globalRate)
+    : 0;
 
   const [resetting, setResetting] = useState(false);
 
@@ -543,7 +567,6 @@ function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
         {/* Two-row stats table */}
         <div style={{ display:"grid", gridTemplateColumns:"auto repeat(6,1fr)", gap:"0 2px",
                       fontFamily:"'DM Mono',monospace", fontSize:11 }}>
-          {/* Row labels */}
           <div style={{ color:"rgba(255,255,255,.4)", fontSize:10, display:"flex", flexDirection:"column", gap:2, paddingRight:8 }}>
             <div style={{ height:36, display:"flex", alignItems:"center", fontWeight:600, letterSpacing:.5 }}>TOTAL</div>
             <div style={{ height:36, display:"flex", alignItems:"center", fontWeight:600, letterSpacing:.5 }}>DONE</div>
@@ -582,6 +605,46 @@ function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
             );
           })}
         </div>
+
+        {/* Global timing bar */}
+        {firstStartedAt ? (
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:4, marginTop:6 }}>
+            {[
+              ["🕐 Started",   fmtTime(firstStartedAt.toISOString()),  "#93c5fd"],
+              ["⏱ Elapsed",    fmtDuration(globalElapsedMin),           "#fbbf24"],
+              ["⏳ Est Remaining", fmtDuration(globalEstRemainingMin),  globalEstRemainingMin < 30 ? "#4ade80" : "#f87171"],
+            ].map(([label, value, color]) => (
+              <div key={label} style={{ background:"rgba(255,255,255,.08)", borderRadius:6,
+                                        padding:"5px 8px", textAlign:"center" }}>
+                <div style={{ color:"rgba(255,255,255,.45)", fontSize:9, letterSpacing:.4,
+                               textTransform:"uppercase", marginBottom:2 }}>{label}</div>
+                <div style={{ color, fontWeight:700, fontSize:13,
+                               fontFamily:"'DM Mono',monospace" }}>{value}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ marginTop:6, padding:"6px 10px", background:"rgba(255,255,255,.05)",
+                        borderRadius:6, textAlign:"center" }}>
+            <span style={{ color:"rgba(255,255,255,.35)", fontSize:11 }}>
+              ⏱ Timing starts when first delivery is marked
+            </span>
+          </div>
+        )}
+
+        {/* Global est total (shown separately once we have a rate) */}
+        {globalEstTotalMin > 0 && (
+          <div style={{ marginTop:4, textAlign:"center" }}>
+            <span style={{ color:"rgba(255,255,255,.4)", fontSize:10 }}>
+              Est total operation: <span style={{ color:"rgba(255,255,255,.7)", fontWeight:600 }}>
+                {fmtDuration(globalEstTotalMin)}
+              </span>
+              {" · "}Est finish: <span style={{ color:"rgba(255,255,255,.7)", fontWeight:600 }}>
+                {fmtTime(new Date(firstStartedAt.getTime() + globalEstTotalMin * 60000).toISOString())}
+              </span>
+            </span>
+          </div>
+        )}
       </header>
 
       {/* Tabs */}
@@ -733,6 +796,7 @@ function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
               {shiftRoutes.map(r => (
                 <RouteCard key={r.id} route={r}
                   liveStops={stopsByRoute[r.id] || []}
+                  now={now}
                   onAssign={() => { setEditingRoute(r.id); setDriverName(r.driver_name || ""); }}
                   onQr={() => showQr(r)}
                   onPrint={() => printSingleRoute(r)}
@@ -801,17 +865,27 @@ function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
 }
 
 // ── Route Card ────────────────────────────────────────────────────────────────
-function RouteCard({ route, liveStops, onAssign, onQr, onPrint, onMarkComplete, onResetRoute, appUrl }) {
+function RouteCard({ route, liveStops, now, onAssign, onQr, onPrint, onMarkComplete, onResetRoute, appUrl }) {
   const [expanded, setExpanded] = useState(false);
   const [stops, setStops]       = useState([]);
   const [completing, setCompleting] = useState(false);
   const [resetting, setResetting]   = useState(false);
 
-  // Live progress from parent-supplied stop statuses (no expand needed)
+  // Live progress from parent-supplied stop statuses
   const liveDelivered = liveStops.filter(s => s.status === "delivered" || s.status === "skipped").length;
   const liveTotal     = liveStops.length || route.total_stops;
   const liveProgress  = liveTotal > 0 ? Math.round(liveDelivered / liveTotal * 100) : 0;
   const isActive      = liveDelivered > 0 && liveDelivered < liveTotal;
+
+  // ── Per-route timing ──────────────────────────────────────────────────────
+  const startedAt     = route.started_at ? new Date(route.started_at) : null;
+  const elapsedMin    = startedAt ? (now - startedAt.getTime()) / 60000 : 0;
+  const rate          = elapsedMin > 0 && liveDelivered > 0 ? liveDelivered / elapsedMin : 0; // stops/min
+  const estTotalMin   = rate > 0 ? liveTotal / rate : 0;
+  const estRemMin     = rate > 0 ? Math.max(0, (liveTotal - liveDelivered) / rate) : 0;
+  const estFinishTime = startedAt && estTotalMin > 0
+    ? new Date(startedAt.getTime() + estTotalMin * 60000)
+    : null;
 
   const loadStops = async () => {
     if (!expanded) {
@@ -836,10 +910,6 @@ function RouteCard({ route, liveStops, onAssign, onQr, onPrint, onMarkComplete, 
     setExpanded(false);
     setResetting(false);
   };
-
-  const progress = stops.length
-    ? Math.round(stops.filter(s => s.status === "delivered").length / stops.length * 100)
-    : 0;
 
   return (
     <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:10,
@@ -872,7 +942,7 @@ function RouteCard({ route, liveStops, onAssign, onQr, onPrint, onMarkComplete, 
 
         {/* Always-visible live progress bar */}
         {liveTotal > 0 && (
-          <div style={{ marginBottom:10 }}>
+          <div style={{ marginBottom: startedAt ? 6 : 10 }}>
             <div style={{ height:5, background:"#e5e7eb", borderRadius:3, marginBottom:4, overflow:"hidden" }}>
               <div style={{
                 height:"100%", borderRadius:3, transition:"width .4s",
@@ -885,6 +955,44 @@ function RouteCard({ route, liveStops, onAssign, onQr, onPrint, onMarkComplete, 
               {liveDelivered}/{liveTotal} stops done
               {liveProgress === 100 ? " ✓" : ""}
             </div>
+          </div>
+        )}
+
+        {/* Per-route timing row */}
+        {startedAt && liveDelivered > 0 && (
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:4, marginBottom:10 }}>
+            <div style={{ background:"#f0fdf4", borderRadius:5, padding:"4px 6px", textAlign:"center" }}>
+              <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:.3 }}>Started</div>
+              <div style={{ fontSize:11, fontWeight:700, color:"#1a3a2a", fontFamily:"'DM Mono',monospace" }}>
+                {fmtTime(route.started_at)}
+              </div>
+            </div>
+            <div style={{ background:"#fffbeb", borderRadius:5, padding:"4px 6px", textAlign:"center" }}>
+              <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:.3 }}>Elapsed</div>
+              <div style={{ fontSize:11, fontWeight:700, color:"#92400e", fontFamily:"'DM Mono',monospace" }}>
+                {fmtDuration(elapsedMin)}
+              </div>
+            </div>
+            <div style={{ background: liveProgress === 100 ? "#f0fdf4" : "#fef2f2", borderRadius:5, padding:"4px 6px", textAlign:"center" }}>
+              <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:.3 }}>
+                {liveProgress === 100 ? "Finished" : "Est Left"}
+              </div>
+              <div style={{ fontSize:11, fontWeight:700,
+                             color: liveProgress === 100 ? "#16a34a" : "#dc2626",
+                             fontFamily:"'DM Mono',monospace" }}>
+                {liveProgress === 100
+                  ? fmtTime(route.completed_at)
+                  : estRemMin > 0 ? fmtDuration(estRemMin) : "—"}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Est finish time (only when in progress with enough data) */}
+        {startedAt && liveDelivered > 0 && liveProgress < 100 && estFinishTime && (
+          <div style={{ marginBottom:10, fontSize:11, color:"#6b7280", textAlign:"center" }}>
+            Est finish: <span style={{ fontWeight:600, color:"#374151" }}>{fmtTime(estFinishTime.toISOString())}</span>
+            {" · "}Est total: <span style={{ fontWeight:600, color:"#374151" }}>{fmtDuration(estTotalMin)}</span>
           </div>
         )}
 
@@ -984,12 +1092,10 @@ function DriverView({ route, onReload }) {
       ));
       setActiveStop(null); setNote("");
 
-      // Mark route in_progress on first delivery
       if (route.status === "assigned") {
         await sbPatch("routes", { status: "in_progress", started_at: new Date().toISOString() },
                       { id: `eq.${route.id}` });
       }
-      // Mark complete if all done
       const updated = stops.map(s => s.id === stopId ? { ...s, status } : s);
       if (updated.every(s => s.status !== "pending")) {
         await sbPatch("routes", { status: "complete", completed_at: new Date().toISOString() },
@@ -1069,7 +1175,6 @@ function DriverView({ route, onReload }) {
                         overflow:"hidden", opacity: stop.status==="delivered" ? .7 : 1 }}>
             <div style={{ padding:"12px 14px" }}>
               <div style={{ display:"flex", gap:10, alignItems:"flex-start" }}>
-                {/* Stop number */}
                 <div style={{ width:28, height:28, borderRadius:"50%", flexShrink:0,
                                background: stop.status==="delivered" ? "#16a34a"
                                           : stop.id === nextStop?.id ? "#1a3a2a" : "#e5e7eb",
@@ -1103,7 +1208,6 @@ function DriverView({ route, onReload }) {
                 </div>
               </div>
 
-              {/* Action buttons */}
               {stop.status === "pending" && (
                 <div style={{ marginTop:10, display:"flex", gap:8 }}>
                   <a href={mapsUrl(stop.address)} target="_blank" rel="noreferrer"
@@ -1120,7 +1224,6 @@ function DriverView({ route, onReload }) {
                 </div>
               )}
 
-              {/* Expanded delivery confirmation */}
               {activeStop === stop.id && stop.status === "pending" && (
                 <div style={{ marginTop:10, padding:12, background:"#f9fafb",
                                borderRadius:8, border:"1px solid #e5e7eb" }}>
@@ -1161,7 +1264,6 @@ function DriverView({ route, onReload }) {
         ))}
       </div>
 
-      {/* All done banner */}
       {stops.length > 0 && stops.every(s => s.status !== "pending") && (
         <div style={{ margin:16, padding:20, background:"#f0fdf4", border:"2px solid #bbf7d0",
                        borderRadius:12, textAlign:"center" }}>
