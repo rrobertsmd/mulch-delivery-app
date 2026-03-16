@@ -940,6 +940,17 @@ function RouteCard({ route, liveStops, now, onAssign, onQr, onPrint, onMarkCompl
               <strong>{v}</strong> {l}
             </div>
           ))}
+          {route.est_minutes && (() => {
+            const h = Math.floor(route.est_minutes / 60);
+            const m = Math.round(route.est_minutes % 60);
+            const label = h > 0 ? `~${h}h ${m}m` : `~${m}m`;
+            return (
+              <div style={{ background:"#eff6ff", borderRadius:6, padding:"4px 8px",
+                             fontFamily:"'DM Mono',monospace", fontSize:12, color:"#2563eb" }}>
+                <strong>{label}</strong>
+              </div>
+            );
+          })()}
         </div>
 
         {/* Always-visible live progress bar */}
