@@ -208,14 +208,17 @@ export default function App() {
         sbGet("stops",         { select: "route_id,status,bags" }),
       ]);
       const parseVehicle = (v = "") => {
+        const isVan = /^van/i.test(v);
         const m = v.match(/(\d+)[^\d]+(\d+)/);
-        return m ? [parseInt(m[1]), parseInt(m[2])] : [0, 0];
+        return m ? [isVan ? 1 : 0, parseInt(m[1]), parseInt(m[2])] : [isVan ? 1 : 0, 0, 0];
       };
       const sorted = (r || []).sort((a, b) => {
         if (a.shift_num !== b.shift_num) return a.shift_num - b.shift_num;
-        const [at, atr] = parseVehicle(a.vehicle);
-        const [bt, btr] = parseVehicle(b.vehicle);
-        return at !== bt ? at - bt : atr - btr;
+        const [atype, anum, atrip] = parseVehicle(a.vehicle);
+        const [btype, bnum, btrip] = parseVehicle(b.vehicle);
+        if (atype !== btype) return atype - btype;
+        if (anum  !== bnum)  return anum  - bnum;
+        return atrip - btrip;
       });
       setRoutes(sorted);
       setPickups(p || []);
@@ -300,15 +303,18 @@ function openPrintWindow(routesList, stopsMatrix, appUrl) {
   const depot = "11135 Newport Mill Rd, Kensington, MD 20895";
 
   const parseVehicle = (v = "") => {
+    const isVan = /^van/i.test(v);
     const m = v.match(/(\d+)[^\d]+(\d+)/);
-    return m ? [parseInt(m[1]), parseInt(m[2])] : [0, 0];
+    return m ? [isVan ? 1 : 0, parseInt(m[1]), parseInt(m[2])] : [isVan ? 1 : 0, 0, 0];
   };
   const order = routesList
     .map((r, i) => ({ r, i }))
     .sort((a, b) => {
-      const [at, atr] = parseVehicle(a.r.vehicle);
-      const [bt, btr] = parseVehicle(b.r.vehicle);
-      return at !== bt ? at - bt : atr - btr;
+      const [atype, anum, atrip] = parseVehicle(a.r.vehicle);
+      const [btype, bnum, btrip] = parseVehicle(b.r.vehicle);
+      if (atype !== btype) return atype - btype;
+      if (anum  !== bnum)  return anum  - bnum;
+      return atrip - btrip;
     });
   const sortedRoutes = order.map(o => o.r);
   const sortedStops  = order.map(o => stopsMatrix[o.i]);
