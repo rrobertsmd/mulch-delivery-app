@@ -1,360 +1,1680 @@
-import { useState, useMemo, useEffect } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from "react";
 
-// ── Mobile detection ────────────────────────────────────────────
-function useIsMobile() {
-  const [mobile, setMobile] = useState(() => window.innerWidth < 768)
+const SUPABASE_URL    = "https://ifllitiozrsmjmmtmckg.supabase.co";
+const SUPABASE_ANON   = "sb_publishable_Q8ZrolEhgNxWdF4_G1xVFw_vvrD45zE";
+
+// ── Supabase REST helpers ─────────────────────────────────────────────────────
+const sb = async (method, table, body = null, params = {}) => {
+  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  const res = await fetch(url, {
+    method,
+    headers: {
+      apikey: SUPABASE_ANON,
+      Authorization: `Bearer ${SUPABASE_ANON}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.status === 204 ? null : res.json();
+};
+
+const sbGet    = (table, params)       => sb("GET",   table, null, params);
+const sbPatch  = (table, body, params) => sb("PATCH", table, body, params);
+
+// ── Realtime subscription (Supabase WebSocket) ────────────────────────────────
+function useRealtime(onChange) {
   useEffect(() => {
-    const fn = () => setMobile(window.innerWidth < 768)
-    window.addEventListener('resize', fn)
-    return () => window.removeEventListener('resize', fn)
-  }, [])
-  return mobile
+    const WS_URL = `wss://${SUPABASE_URL.replace("https://", "")}/realtime/v1/websocket?apikey=${SUPABASE_ANON}&vsn=1.0.0`;
+    const TABLES  = ["stops", "routes", "pickup_orders"];
+    let ws        = null;
+    let heartbeat = null;
+    let ref       = 0;
+    let dead      = false;
+
+    const connect = () => {
+      if (dead) return;
+      ws = new WebSocket(WS_URL);
+
+      ws.onopen = () => {
+        TABLES.forEach(table => {
+          ws.send(JSON.stringify({
+            topic:   `realtime:public:${table}`,
+            event:   "phx_join",
+            payload: {
+              config: {
+                broadcast:        { self: false },
+                presence:         { key: "" },
+                postgres_changes: [{ event: "*", schema: "public", table }],
+              },
+            },
+            ref: String(++ref),
+          }));
+        });
+
+        heartbeat = setInterval(() => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              topic: "phoenix", event: "heartbeat", payload: {}, ref: String(++ref),
+            }));
+          }
+        }, 25000);
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.event === "postgres_changes") onChange();
+        } catch { /* ignore */ }
+      };
+
+      ws.onclose = () => {
+        clearInterval(heartbeat);
+        if (!dead) setTimeout(connect, 3000);
+      };
+
+      ws.onerror = () => ws.close();
+    };
+
+    connect();
+
+    return () => {
+      dead = true;
+      clearInterval(heartbeat);
+      ws?.close();
+    };
+  }, [onChange]);
 }
 
-// ── Shared style tokens ─────────────────────────────────────────
-const BG0 = '#060e1a'
-const BG1 = '#080f1c'
-const BORDER = '#0d2035'
-const TEXT_HI = '#e8f4ff'
-const TEXT_MID = '#5a8ab0'
-const TEXT_LO = '#2a4a6a'
-const ACCENT = '#5bb8ff'
-
-const S = {
-  app: {
-    display: 'flex', minHeight: '100vh', background: BG0,
-    fontFamily: "'IBM Plex Sans', sans-serif",
-  },
-
-  // ── Desktop sidebar ──────────────────────────────────────────
-  sidebar: {
-    width: 280, minWidth: 280, background: BG1,
-    borderRight: `1px solid ${BORDER}`, display: 'flex',
-    flexDirection: 'column', position: 'sticky', top: 0,
-    height: '100vh', overflowY: 'auto',
-  },
-  sidebarHeader: { padding: '28px 20px 16px', borderBottom: `1px solid ${BORDER}` },
-  wordmark: {
-    fontSize: 11, fontWeight: 600, color: '#3a6a9a',
-    letterSpacing: '0.14em', textTransform: 'uppercase', marginBottom: 4,
-  },
-  sidebarTitle: { fontSize: 18, fontWeight: 600, color: TEXT_HI, lineHeight: 1.2 },
-  sidebarSubtitle: { fontSize: 11, color: TEXT_LO, marginTop: 6 },
-  searchWrap: { padding: '12px 16px', borderBottom: `1px solid ${BORDER}` },
-  searchInput: {
-    width: '100%', background: '#0a1826', border: `1px solid #1a3050`,
-    borderRadius: 6, padding: '7px 10px', fontSize: 12,
-    color: '#c8d8e8', fontFamily: "'IBM Plex Sans', sans-serif", outline: 'none',
-    boxSizing: 'border-box',
-  },
-  catSection: { padding: '10px 0' },
-  catLabel: {
-    fontSize: 10, fontWeight: 600, letterSpacing: '0.12em',
-    textTransform: 'uppercase', color: TEXT_LO,
-    padding: '8px 20px 5px', display: 'flex', alignItems: 'center', gap: 6,
-  },
-  catDot: (color) => ({
-    display: 'inline-block', width: 6, height: 6,
-    borderRadius: '50%', background: color, flexShrink: 0,
-  }),
-  chartItem: (active) => ({
-    padding: '8px 20px', cursor: 'pointer',
-    background: active ? '#0d2035' : 'transparent',
-    borderLeft: active ? `2px solid ${ACCENT}` : '2px solid transparent',
-    transition: 'background 0.1s',
-  }),
-  chartItemTitle: (active) => ({
-    fontSize: 13, color: active ? TEXT_HI : TEXT_MID,
-    fontWeight: active ? 500 : 400, lineHeight: 1.35,
-  }),
-
-  // ── Main panel ───────────────────────────────────────────────
-  main: { flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 },
-  topBar: {
-    padding: '14px 28px', borderBottom: `1px solid ${BORDER}`,
-    background: BG1, position: 'sticky', top: 0, zIndex: 10,
-    display: 'flex', alignItems: 'center', gap: 12,
-  },
-  catBadge: (color) => ({
-    fontSize: 10, fontWeight: 600, letterSpacing: '0.1em',
-    textTransform: 'uppercase', color, padding: '3px 8px',
-    background: color + '18', border: `1px solid ${color}35`,
-    borderRadius: 4, whiteSpace: 'nowrap',
-  }),
-  topBarTitle: { fontSize: 16, fontWeight: 500, color: TEXT_HI },
-  content: { flex: 1, overflow: 'auto' },
-  empty: {
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-    height: '60vh', flexDirection: 'column', gap: 12,
-  },
-  emptyText: { fontSize: 14, color: TEXT_LO },
-  hint: {
-    margin: '0 28px 28px', padding: '12px 16px',
-    background: BG1, border: `1px solid ${BORDER}`,
-    borderLeft: '3px solid #1e4a7a', borderRadius: 6,
-    fontSize: 12, color: '#3a6a8a', lineHeight: 1.8,
-  },
-  code: { fontFamily: "'IBM Plex Mono', monospace", color: ACCENT, fontSize: 11 },
+// ── Live clock hook (ticks every 30s) ────────────────────────────────────────
+function useNow() {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, []);
+  return now;
 }
 
-// ── Chart list (shared between sidebar and drawer) ──────────────
-function ChartList({ grouped, activeId, onSelect, search, setSearch, compact = false }) {
+// ── Timing helpers ────────────────────────────────────────────────────────────
+const fmtDuration = (minutes) => {
+  if (!minutes || !isFinite(minutes) || minutes < 0) return "—";
+  const h = Math.floor(minutes / 60);
+  const m = Math.round(minutes % 60);
+  if (h === 0) return `${m}m`;
+  return `${h}h ${m}m`;
+};
+
+const fmtTime = (isoString) => {
+  if (!isoString) return "—";
+  return new Date(isoString).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+};
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'DM Sans',sans-serif;background:#f4f6f8;color:#111827;-webkit-font-smoothing:antialiased}
+  ::-webkit-scrollbar{width:4px;height:4px}
+  ::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:2px}
+  button{cursor:pointer;font-family:'DM Sans',sans-serif;-webkit-appearance:none;appearance:none}
+  input{font-family:'DM Sans',sans-serif}
+  a{color:inherit;text-decoration:none}
+`;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const SHIFTS  = ["Shift 1 (7:30am)", "Shift 2 (10:30am)", "Shift 3 (1:30pm)"];
+const SHIFT_COLORS = ["#1a6b3a", "#2563eb", "#7c3aed"];
+
+// ── Utility ───────────────────────────────────────────────────────────────────
+const statusColor = (s) => ({
+  unassigned:  "#6b7280",
+  assigned:    "#2563eb",
+  in_progress: "#d97706",
+  complete:    "#16a34a",
+  pending:     "#6b7280",
+  delivered:   "#16a34a",
+  skipped:     "#dc2626",
+}[s] || "#6b7280");
+
+const statusLabel = (s) => ({
+  unassigned:  "Unassigned",
+  assigned:    "Assigned",
+  in_progress: "In Progress",
+  complete:    "Complete",
+  pending:     "Pending",
+  delivered:   "✓ Delivered",
+  skipped:     "Skipped",
+}[s] || s);
+
+const mapsUrl = (address) =>
+  `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
+const wazeUrl = (lat, lng) =>
+  `https://waze.com/ul?ll=${lat},${lng}&navigate=yes`;
+const appleMapsUrl = (address) =>
+  `maps://maps.apple.com/?q=${encodeURIComponent(address)}`;
+const DEPOT_ADDRESS = "11135 Newport Mill Rd, Kensington, MD 20895";
+// ── Vehicle helpers ───────────────────────────────────────────────────────────
+const getVehicleBase = (v = "") => v.replace(/\s*[Tt]rip\s*\d+/g, "").trim();
+const getVehicleType = (v = "") => /van/i.test(v) ? "van" : "truck";
+
+// ── Driver CSV parser (SignUpGenius format) ───────────────────────────────────
+function parseDriversCsv(text) {
+  const rows = [];
+  let cur = "", inQ = false, fields = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      if (inQ && text[i + 1] === '"') { cur += '"'; i++; }
+      else inQ = !inQ;
+    } else if (c === "," && !inQ) {
+      fields.push(cur); cur = "";
+    } else if ((c === "\n" || c === "\r") && !inQ) {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      fields.push(cur); cur = "";
+      rows.push(fields); fields = [];
+    } else { cur += c; }
+  }
+  if (fields.length || cur) { fields.push(cur); rows.push(fields); }
+  const drivers = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    if (row.length < 5) continue;
+    const firstName = row[0].trim();
+    const lastName  = row[1].trim();
+    if (!firstName && !lastName) continue;
+    const email    = row[2].trim();
+    const rawPhone = row[3].trim().replace(/\D/g, "").replace(/^1(\d{10})$/, "$1");
+    const phone    = rawPhone.length === 10
+      ? `(${rawPhone.slice(0,3)}) ${rawPhone.slice(3,6)}-${rawPhone.slice(6)}`
+      : rawPhone;
+    const signUpText = row[4] || "";
+    const key = `${firstName.toLowerCase()}_${lastName.toLowerCase()}`;
+    const existing = drivers.find(d =>
+      `${d.firstName.toLowerCase()}_${d.lastName.toLowerCase()}` === key);
+    const lines = signUpText.split("\n").map(s => s.trim()).filter(Boolean);
+    const newSignups = [];
+    for (const line of lines) {
+      let shift_num = null;
+      if (/7:30\s*am/i.test(line))       shift_num = 1;
+      else if (/10:30\s*am/i.test(line)) shift_num = 2;
+      else if (/1:30\s*pm/i.test(line))  shift_num = 3;
+      if (!shift_num) continue;
+      let vehicleType = null;
+      if (/truck/i.test(line))      vehicleType = "truck";
+      else if (/van/i.test(line))   vehicleType = "van";
+      if (!vehicleType) continue;
+      const sportMatch = line.match(/(?:truck|van)[^\-\n]*-\s*(.+)/i);
+      const sport = sportMatch ? sportMatch[1].replace(/,$/, "").trim() : "";
+      newSignups.push({ shift_num, vehicleType, sport });
+    }
+    if (existing) {
+      for (const s of newSignups)
+        if (!existing.signups.some(e => e.shift_num === s.shift_num && e.vehicleType === s.vehicleType))
+          existing.signups.push(s);
+      if (!existing.phone && phone) existing.phone = phone;
+    } else {
+      drivers.push({ id: `${key}_${r}`, firstName, lastName, email, phone, signups: newSignups });
+    }
+  }
+  return drivers;
+}
+const fullRouteUrl = (stops) => {
+  if (!stops?.length) return "#";
+  const origin = encodeURIComponent(DEPOT_ADDRESS);
+  const dest   = encodeURIComponent(DEPOT_ADDRESS);
+  const waypts = stops.map(s => encodeURIComponent(s.address)).join("|");
+  return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${dest}${waypts ? `&waypoints=${waypts}` : ""}`;
+};
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [view, setView]         = useState("login");
+  const [driverRoute, setDriverRoute] = useState(null);
+  const [driverPin, setDriverPin]     = useState("");
+  const [pinError, setPinError]       = useState("");
+  const [routes, setRoutes]     = useState([]);
+  const [pickups, setPickups]   = useState([]);
+  const [allStops, setAllStops] = useState([]);
+  const [loading, setLoading]   = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const routeId = params.get("route");
+    if (routeId) {
+      setView("driver_loading");
+      loadDriverRoute(routeId);
+    }
+  }, []);
+
+  const loadDriverRoute = async (routeId) => {
+    try {
+      const [routeArr, stops] = await Promise.all([
+        sbGet("routes", { select: "*", id: `eq.${routeId}` }),
+        sbGet("stops",  { select: "*", route_id: `eq.${routeId}`, order: "stop_num.asc" }),
+      ]);
+      if (routeArr?.length) {
+        setDriverRoute({ ...routeArr[0], stops: stops || [] });
+        setView("driver");
+      }
+    } catch(e) {
+      console.error(e);
+      setView("login");
+    }
+  };
+
+  const loadManagerData = useCallback(async () => {
+    try {
+      const [r, p, s] = await Promise.all([
+        sbGet("routes",        { select: "*", order: "shift_num.asc" }),
+        sbGet("pickup_orders", { select: "*", order: "name.asc" }),
+        sbGet("stops",         { select: "route_id,status,bags" }),
+      ]);
+      const parseVehicle = (v = "") => {
+        const isVan = /^van/i.test(v);
+        const m = v.match(/(\d+)[^\d]+(\d+)/);
+        return m ? [isVan ? 1 : 0, parseInt(m[1]), parseInt(m[2])] : [isVan ? 1 : 0, 0, 0];
+      };
+      const sorted = (r || []).sort((a, b) => {
+        if (a.shift_num !== b.shift_num) return a.shift_num - b.shift_num;
+        const [atype, anum, atrip] = parseVehicle(a.vehicle);
+        const [btype, bnum, btrip] = parseVehicle(b.vehicle);
+        if (atype !== btype) return atype - btype;
+        if (anum  !== bnum)  return anum  - bnum;
+        return atrip - btrip;
+      });
+      setRoutes(sorted);
+      setPickups(p || []);
+      setAllStops(s || []);
+    } catch(e) { console.error(e); }
+  }, []);
+
+  useRealtime(loadManagerData);
+
+  useEffect(() => {
+    if (view === "manager") loadManagerData();
+  }, [view, loadManagerData]);
+
+  const handleManagerLogin = (pin) => {
+    if (pin === "2026") { setView("manager"); setPinError(""); }
+    else setPinError("Incorrect PIN");
+  };
+
+  if (view === "login" || view === "driver_loading") {
+    return <LoginScreen
+      onManager={handleManagerLogin}
+      pinError={pinError}
+      loading={view === "driver_loading"}
+    />;
+  }
+  if (view === "driver" && driverRoute) {
+    return <DriverView route={driverRoute} onReload={() => loadDriverRoute(driverRoute.id)} />;
+  }
+  return <ManagerDashboard
+    routes={routes}
+    pickups={pickups}
+    allStops={allStops}
+    onReload={loadManagerData}
+    loading={loading}
+  />;
+}
+
+// ── Login Screen ──────────────────────────────────────────────────────────────
+function LoginScreen({ onManager, pinError, loading }) {
+  const [pin, setPin] = useState("");
+
   return (
-    <>
-      <div style={{ padding: compact ? '10px 14px' : '12px 16px', borderBottom: `1px solid ${BORDER}` }}>
-        <input
-          style={{ ...S.searchInput, fontSize: compact ? 14 : 12 }}
-          placeholder="Search charts…"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          autoComplete="off"
-        />
-      </div>
-      <nav style={{ ...S.catSection, overflowY: 'auto', flex: 1 }}>
-        {Object.values(grouped).map(cat => (
-          <div key={cat.id}>
-            <div style={{ ...S.catLabel, fontSize: compact ? 11 : 10, padding: compact ? '10px 16px 6px' : '8px 20px 5px' }}>
-              <span style={S.catDot(cat.color)} />
-              {cat.label}
+    <div style={{ minHeight:"100vh", background:"linear-gradient(135deg,#1a3a2a 0%,#2d6e3a 100%)",
+                  display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+      <style>{css}</style>
+      <div style={{ background:"#fff", borderRadius:16, padding:40, width:"100%", maxWidth:360,
+                    boxShadow:"0 20px 60px rgba(0,0,0,.3)", textAlign:"center" }}>
+        <div style={{ fontSize:48, marginBottom:12 }}>🌿</div>
+        <h1 style={{ fontSize:22, fontWeight:700, color:"#1a3a2a", marginBottom:4 }}>AEHS Mulch 2026</h1>
+        <p style={{ color:"#6b7280", fontSize:14, marginBottom:32 }}>Delivery Management</p>
+
+        {loading ? (
+          <p style={{ color:"#6b7280" }}>Loading your route...</p>
+        ) : (
+          <>
+            <div style={{ background:"#f9fafb", borderRadius:10, padding:20, marginBottom:16, textAlign:"left" }}>
+              <p style={{ fontSize:12, fontWeight:600, color:"#6b7280", marginBottom:8, letterSpacing:.5, textTransform:"uppercase" }}>Manager Access</p>
+              <input
+                type="password" placeholder="Enter PIN" value={pin}
+                onChange={e => setPin(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && onManager(pin)}
+                style={{ width:"100%", height:42, padding:"0 12px", border:"1px solid #e5e7eb",
+                         borderRadius:8, fontSize:16, outline:"none", letterSpacing:4, marginBottom:8 }}
+              />
+              {pinError && <p style={{ color:"#dc2626", fontSize:12 }}>{pinError}</p>}
+              <button onClick={() => onManager(pin)}
+                style={{ width:"100%", height:42, background:"#1a3a2a", color:"#fff",
+                         border:"none", borderRadius:8, fontWeight:600, fontSize:14 }}>
+                Open Dashboard
+              </button>
             </div>
-            {cat.charts.map(chart => (
-              <div
-                key={chart.id}
-                style={{
-                  ...S.chartItem(chart.id === activeId),
-                  padding: compact ? '12px 16px' : '8px 20px',
-                }}
-                onClick={() => onSelect(chart.id)}
-              >
-                <div style={{ ...S.chartItemTitle(chart.id === activeId), fontSize: compact ? 15 : 13 }}>
-                  {chart.title}
+            <p style={{ fontSize:12, color:"#9ca3af" }}>Drivers: scan your QR code to access your route</p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Print Route Sheets ────────────────────────────────────────────────────────
+function openPrintWindow(routesList, stopsMatrix, appUrl) {
+  const depot = "11135 Newport Mill Rd, Kensington, MD 20895";
+
+  const parseVehicle = (v = "") => {
+    const isVan = /^van/i.test(v);
+    const m = v.match(/(\d+)[^\d]+(\d+)/);
+    return m ? [isVan ? 1 : 0, parseInt(m[1]), parseInt(m[2])] : [isVan ? 1 : 0, 0, 0];
+  };
+  const order = routesList
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => {
+      const [atype, anum, atrip] = parseVehicle(a.r.vehicle);
+      const [btype, bnum, btrip] = parseVehicle(b.r.vehicle);
+      if (atype !== btype) return atype - btype;
+      if (anum  !== bnum)  return anum  - bnum;
+      return atrip - btrip;
+    });
+  const sortedRoutes = order.map(o => o.r);
+  const sortedStops  = order.map(o => stopsMatrix[o.i]);
+
+  const pages = sortedRoutes.map((r, i) => {
+    const stops = sortedStops[i] || [];
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(appUrl(r.id))}`;
+    const statsHtml = `<span>${r.total_stops} stops</span><span>${r.total_bags} bags</span>${r.total_miles ? `<span>${Number(r.total_miles).toFixed(1)} mi</span>` : ""}`;
+
+    const rows = stops.map(s => `
+      <tr>
+        <td class="col-num">${s.stop_num}</td>
+        <td class="col-customer">
+          <strong>${s.name || ""}</strong><br/>
+          ${(s.address || "").replace(/, USA$/, "")}<br/>
+          ${s.phone ? `<span class="phone">&#9990; ${s.phone}</span>` : ""}
+        </td>
+        <td class="col-bags"><strong>${s.bags} bags</strong></td>
+        <td class="col-instr">${s.instructions || "&#8212;"}</td>
+      </tr>`).join("");
+
+    return `
+      <div class="page">
+        <div class="page-header">
+          <div class="header-text">
+            <div class="event-label">AEHS BOOSTERS MULCH DELIVERY 2026</div>
+            <div class="route-name">${r.vehicle}</div>
+            <div class="shift-name">${r.shift}${r.driver_name ? ` &mdash; 👤 ${r.driver_name}` : " &mdash; <em>Unassigned</em>"}</div>
+            <div class="stats">${statsHtml}</div>
+          </div>
+          <div class="header-qr">
+            <img src="${qrUrl}" width="110" height="110" alt="QR"/>
+            <div class="qr-caption">Scan for mobile route</div>
+          </div>
+        </div>
+        <div class="depot-row">
+          &#128205; <strong>AEHS:</strong> ${depot}
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th class="col-num">#</th>
+              <th class="col-customer">CUSTOMER / ADDRESS</th>
+              <th class="col-bags">BAGS</th>
+              <th class="col-instr">DELIVERY INSTRUCTIONS</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <div class="keys-reminder">&#128273; Please Leave Keys in Vehicle</div>
+        <div class="page-footer">
+          <span>AEHS Boosters &middot; mulch-delivery-app.vercel.app</span>
+          <span>${r.vehicle} &middot; ${r.shift}</span>
+        </div>
+      </div>`;
+  }).join("");
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Route Sheets &mdash; ${routesList[0]?.shift || ""}</title>
+  <style>
+    @page { size: letter; margin: 0.65in 0.75in; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #111; }
+    .page { page-break-after: always; display: flex; flex-direction: column; min-height: 9.5in; }
+    .page:last-child { page-break-after: avoid; }
+    .page-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
+    .event-label { font-size: 8.5px; font-weight: 700; color: #1a6b3a; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 4px; }
+    .route-name { font-size: 30px; font-weight: 900; line-height: 1.1; margin-bottom: 2px; }
+    .shift-name { font-size: 12px; color: #555; margin-bottom: 8px; }
+    .stats span { font-size: 11px; border: 1px solid #ccc; border-radius: 12px; padding: 2px 10px; margin-right: 6px; color: #333; }
+    .header-qr { text-align: center; flex-shrink: 0; }
+    .qr-caption { font-size: 9px; color: #666; margin-top: 4px; }
+    .depot-row { background: #fffde7; border: 1px solid #ffe082; border-radius: 6px;
+                 padding: 7px 12px; margin-bottom: 12px; font-size: 11px; color: #5a3e00; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    thead tr { background: #f5f5f5; }
+    th { padding: 6px 8px; text-align: left; font-size: 9px; font-weight: 700; color: #888;
+         text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; }
+    td { padding: 10px 8px; border-bottom: 1px solid #ebebeb; vertical-align: top; line-height: 1.5; }
+    tr:nth-child(even) td { background: #fafafa; }
+    .col-num  { width: 28px; text-align: center; font-weight: 700; }
+    .col-customer { width: 36%; }
+    .col-bags { width: 80px; color: #1a6b3a; }
+    .col-instr { color: #333; }
+    .phone { color: #555; font-size: 10px; }
+    .keys-reminder { margin-top: 14px; text-align: center; color: #cc0000; font-weight: 700;
+                     font-size: 14px; letter-spacing: 0.5px; }
+    .page-footer { margin-top: auto; padding-top: 10px; border-top: 1px solid #ddd;
+                   display: flex; justify-content: space-between; font-size: 9px; color: #aaa; }
+  </style>
+</head>
+<body>${pages}</body>
+</html>`;
+
+  const w = window.open("", "_blank");
+  if (!w) { alert("Pop-up blocked — please allow pop-ups for this site."); return; }
+  w.document.write(html);
+  w.document.close();
+  w.focus();
+  setTimeout(() => w.print(), 800);
+}
+
+// ── Manager Dashboard ─────────────────────────────────────────────────────────
+const DRIVERS_KEY = "mulch_drivers_2026";
+
+function ManagerDashboard({ routes, pickups, allStops, onReload, loading }) {
+  const [activeShift, setActiveShift] = useState(0);
+  const [activeTab,   setActiveTab]   = useState("routes");
+  const [editingRoute, setEditingRoute] = useState(null);
+  const [driverName, setDriverName]     = useState("");
+  const [selectedDriverId, setSelectedDriverId] = useState(null);
+  const [saving, setSaving]             = useState(false);
+  const [qrRoute, setQrRoute]           = useState(null);
+  const [printing, setPrinting]         = useState(false);
+  const [drivers, setDrivers]           = useState(() => {
+    try { return JSON.parse(localStorage.getItem(DRIVERS_KEY) || "[]"); } catch { return []; }
+  });
+  const [autoAssignPrompt, setAutoAssignPrompt] = useState(null);
+  const [autoAssigning, setAutoAssigning]       = useState(false);
+
+  const now = useNow();
+
+  const shiftRoutes = routes.filter(r => r.shift_num === activeShift + 1);
+
+  const stopsByRoute = allStops.reduce((acc, s) => {
+    if (!acc[s.route_id]) acc[s.route_id] = [];
+    acc[s.route_id].push(s);
+    return acc;
+  }, {});
+
+  // Stats — Totals
+  const deliveryBags    = routes.reduce((a, r) => a + r.total_bags, 0);
+  const pickupBags      = pickups.reduce((a, p) => a + (p.bags || 0), 0);
+  const totalBags       = deliveryBags + pickupBags;
+  const totalStops      = routes.reduce((a, r) => a + r.total_stops, 0);
+  const assigned        = routes.filter(r => r.status !== "unassigned").length;
+  const completed       = routes.filter(r => r.status === "complete").length;
+  const totalHouseholds = totalStops + pickups.length;
+  const totalMiles      = routes.reduce((a, r) => a + (r.total_miles || 0), 0);
+
+  // Stats — Progress
+  const deliveredStops  = allStops.filter(s => s.status === "delivered" || s.status === "skipped");
+  const doneStops       = deliveredStops.length;
+  const doneBags        = allStops.filter(s => s.status === "delivered").reduce((a, s) => a + (s.bags || 0), 0)
+                        + pickups.filter(p => p.checked_out).reduce((a, p) => a + (p.bags || 0), 0);
+  const donePickups     = pickups.filter(p => p.checked_out).length;
+  const doneHouseholds  = doneStops + donePickups;
+  const doneRoutes      = routes.filter(r => r.status === "complete");
+  const doneMiles       = doneRoutes.reduce((a, r) => a + (r.total_miles || 0), 0);
+
+  // ── Global timing ──────────────────────────────────────────────────────────
+  const startedRoutes = routes.filter(r => r.started_at);
+  const firstStartedAt = startedRoutes.length
+    ? new Date(Math.min(...startedRoutes.map(r => new Date(r.started_at).getTime())))
+    : null;
+
+  const globalElapsedMin = firstStartedAt ? (now - firstStartedAt.getTime()) / 60000 : 0;
+  const globalRate = globalElapsedMin > 0 && doneStops > 0
+    ? doneStops / globalElapsedMin   // stops per minute
+    : 0;
+  const globalEstTotalMin = globalRate > 0 ? totalHouseholds / globalRate : 0;
+  const globalEstRemainingMin = globalRate > 0
+    ? Math.max(0, (totalHouseholds - doneHouseholds) / globalRate)
+    : 0;
+
+  const [resetting, setResetting] = useState(false);
+
+  const resetAll = async () => {
+    if (!window.confirm("⚠️ Reset ALL routes and stops to unassigned/pending? This cannot be undone.")) return;
+    setResetting(true);
+    try {
+      await sbPatch("routes", { status: "unassigned", completed_at: null, started_at: null, driver_name: null },
+                    { id: "neq.00000000-0000-0000-0000-000000000000" });
+      await sbPatch("stops",  { status: "pending", completed_at: null, driver_note: null },
+                    { id: "neq.00000000-0000-0000-0000-000000000000" });
+      await sbPatch("pickup_orders", { checked_out: false, checked_out_at: null, checked_out_by: null },
+                    { id: "neq.00000000-0000-0000-0000-000000000000" });
+      onReload();
+    } catch(e) { console.error(e); }
+    setResetting(false);
+  };
+
+  const markRouteComplete = async (routeId) => {
+    try {
+      await sbPatch("routes", { status: "complete", completed_at: new Date().toISOString() },
+                    { id: `eq.${routeId}` });
+      await sbPatch("stops", { status: "delivered", completed_at: new Date().toISOString() },
+                    { route_id: `eq.${routeId}`, status: "neq.skipped" });
+      onReload();
+    } catch(e) { console.error(e); }
+  };
+
+  const resetRoute = async (routeId) => {
+    try {
+      await sbPatch("routes", { status: "unassigned", completed_at: null, started_at: null, driver_name: null },
+                    { id: `eq.${routeId}` });
+      await sbPatch("stops",  { status: "pending", completed_at: null, driver_note: null },
+                    { route_id: `eq.${routeId}` });
+      onReload();
+    } catch(e) { console.error(e); }
+  };
+
+  const assignDriver = async () => {
+    if (!editingRoute || !driverName.trim()) return;
+    setSaving(true);
+    try {
+      const route = routes.find(r => r.id === editingRoute);
+      const vehicleBase = getVehicleBase(route.vehicle);
+      const siblings = routes.filter(r =>
+        getVehicleBase(r.vehicle) === vehicleBase && r.shift_num === route.shift_num
+      );
+      await Promise.all(siblings.map(r =>
+        sbPatch("routes", { driver_name: driverName.trim(), status: "assigned" }, { id: `eq.${r.id}` })
+      ));
+      setEditingRoute(null); setDriverName(""); setSelectedDriverId(null);
+      onReload();
+    } catch(e) { console.error(e); }
+    setSaving(false);
+  };
+
+  const handleCsvUpload = (csvText) => {
+    const parsed = parseDriversCsv(csvText);
+    if (!parsed.length) { alert("No drivers found. Check the CSV format."); return; }
+    setAutoAssignPrompt(parsed);
+  };
+
+  const commitDrivers = (parsed) => {
+    setDrivers(parsed);
+    localStorage.setItem(DRIVERS_KEY, JSON.stringify(parsed));
+  };
+
+  const performAutoAssign = async (driverList) => {
+    setAutoAssigning(true);
+    try {
+      const unassigned = routes.filter(r => r.status === "unassigned");
+      const groups = {};
+      for (const r of unassigned) {
+        const base = getVehicleBase(r.vehicle);
+        const key  = `${base}__${r.shift_num}`;
+        if (!groups[key]) groups[key] = { routes: [], vehicleType: getVehicleType(r.vehicle), shift_num: r.shift_num };
+        groups[key].routes.push(r);
+      }
+      const usedPerShift = {};
+      const patches = [];
+      for (const { routes: gRoutes, vehicleType, shift_num } of Object.values(groups)) {
+        if (!usedPerShift[shift_num]) usedPerShift[shift_num] = new Set();
+        const driver = driverList.find(d =>
+          d.signups.some(s => s.shift_num === shift_num && s.vehicleType === vehicleType) &&
+          !usedPerShift[shift_num].has(d.id)
+        );
+        if (driver) {
+          usedPerShift[shift_num].add(driver.id);
+          const name = `${driver.firstName} ${driver.lastName}`;
+          for (const r of gRoutes)
+            patches.push(sbPatch("routes", { driver_name: name, status: "assigned" }, { id: `eq.${r.id}` }));
+        }
+      }
+      await Promise.all(patches);
+      onReload();
+    } catch(e) { console.error(e); }
+    setAutoAssigning(false);
+  };
+
+  const showQr = (route) => setQrRoute(route);
+  const appUrl = (routeId) => `${window.location.origin}?route=${routeId}`;
+
+  const printSingleRoute = async (route) => {
+    try {
+      const stops = await sbGet("stops", { select:"*", route_id:`eq.${route.id}`, order:"stop_num.asc" });
+      openPrintWindow([route], [stops || []], appUrl);
+    } catch(e) { console.error(e); }
+  };
+
+  const printShiftRoutes = async () => {
+    setPrinting(true);
+    try {
+      const shiftRts = routes.filter(r => r.shift_num === activeShift + 1);
+      const stopsArr = await Promise.all(
+        shiftRts.map(r => sbGet("stops", { select:"*", route_id:`eq.${r.id}`, order:"stop_num.asc" }))
+      );
+      openPrintWindow(shiftRts, stopsArr.map(s => s || []), appUrl);
+    } catch(e) { console.error(e); }
+    setPrinting(false);
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column" }}>
+      <style>{css}</style>
+
+      {/* Header */}
+      <header style={{ background:"#1a3a2a", padding:"10px 20px",
+                       position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <span style={{ fontSize:22 }}>🌿</span>
+            <span style={{ color:"#fff", fontWeight:700, fontSize:15 }}>AEHS Mulch <span style={{ color:"#4ade80" }}>Manager</span></span>
+          </div>
+          <div style={{ display:"flex", gap:6 }}>
+            <button onClick={onReload}
+              style={{ background:"rgba(255,255,255,.1)", border:"1px solid rgba(255,255,255,.2)",
+                       color:"#fff", borderRadius:6, padding:"4px 10px", fontSize:12 }}>↻</button>
+            <button onClick={resetAll} disabled={resetting}
+              style={{ background:"rgba(220,38,38,.25)", border:"1px solid rgba(220,38,38,.5)",
+                       color:"#fca5a5", borderRadius:6, padding:"4px 10px", fontSize:12, fontWeight:600 }}>
+              {resetting ? "…" : "⚠️ Reset"}
+            </button>
+          </div>
+        </div>
+
+        {/* Two-row stats table */}
+        <div style={{ display:"grid", gridTemplateColumns:"auto repeat(6,1fr)", gap:"0 2px",
+                      fontFamily:"'DM Mono',monospace", fontSize:11 }}>
+          <div style={{ color:"rgba(255,255,255,.4)", fontSize:10, display:"flex", flexDirection:"column", gap:2, paddingRight:8 }}>
+            <div style={{ height:36, display:"flex", alignItems:"center", fontWeight:600, letterSpacing:.5 }}>TOTAL</div>
+            <div style={{ height:36, display:"flex", alignItems:"center", fontWeight:600, letterSpacing:.5 }}>DONE</div>
+          </div>
+
+          {[
+            ["Bags",       totalBags.toLocaleString(),                    doneBags.toLocaleString()],
+            ["Households", totalHouseholds,                               doneHouseholds],
+            ["Stops",      totalStops,                                    doneStops],
+            ["Routes",     routes.length,                                 completed],
+            ["Miles",      totalMiles ? totalMiles.toFixed(0) : "—",     doneMiles.toFixed(0)],
+            ["Assigned",   `${assigned}/${routes.length}`,                null],
+          ].map(([label, total, done]) => {
+            const pct = done !== null && parseFloat(String(total).replace(/,/g,"")) > 0
+              ? Math.round(parseFloat(String(done).replace(/,/g,"")) / parseFloat(String(total).replace(/,/g,"")) * 100)
+              : 0;
+            return (
+              <div key={label} style={{ background:"rgba(255,255,255,.07)", borderRadius:6, padding:"4px 8px", textAlign:"center" }}>
+                <div style={{ color:"rgba(255,255,255,.5)", fontSize:9, letterSpacing:.5, textTransform:"uppercase", marginBottom:2 }}>{label}</div>
+                <div style={{ height:30, display:"flex", alignItems:"center", justifyContent:"center" }}>
+                  <span style={{ color:"#fff", fontWeight:700, fontSize:15 }}>{total}</span>
                 </div>
+                {done !== null ? (
+                  <>
+                    <div style={{ height:2, background:"rgba(255,255,255,.15)", borderRadius:1, margin:"2px 0 4px" }}>
+                      <div style={{ height:"100%", background:"#4ade80", borderRadius:1, width:`${pct}%`, transition:"width .4s" }} />
+                    </div>
+                    <div style={{ height:24, display:"flex", alignItems:"center", justifyContent:"center" }}>
+                      <span style={{ color:"#4ade80", fontWeight:600, fontSize:13 }}>{done}</span>
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ height:30 }} />
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Global timing bar */}
+        {firstStartedAt ? (
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:4, marginTop:6 }}>
+            {[
+              ["🕐 Started",   fmtTime(firstStartedAt.toISOString()),  "#93c5fd"],
+              ["⏱ Elapsed",    fmtDuration(globalElapsedMin),           "#fbbf24"],
+              ["⏳ Est Remaining", fmtDuration(globalEstRemainingMin),  globalEstRemainingMin < 30 ? "#4ade80" : "#f87171"],
+            ].map(([label, value, color]) => (
+              <div key={label} style={{ background:"rgba(255,255,255,.08)", borderRadius:6,
+                                        padding:"5px 8px", textAlign:"center" }}>
+                <div style={{ color:"rgba(255,255,255,.45)", fontSize:9, letterSpacing:.4,
+                               textTransform:"uppercase", marginBottom:2 }}>{label}</div>
+                <div style={{ color, fontWeight:700, fontSize:13,
+                               fontFamily:"'DM Mono',monospace" }}>{value}</div>
               </div>
             ))}
           </div>
-        ))}
-        {Object.keys(grouped).length === 0 && (
-          <div style={{ padding: '20px', fontSize: 13, color: TEXT_LO }}>
-            No charts match "{search}"
+        ) : (
+          <div style={{ marginTop:6, padding:"6px 10px", background:"rgba(255,255,255,.05)",
+                        borderRadius:6, textAlign:"center" }}>
+            <span style={{ color:"rgba(255,255,255,.35)", fontSize:11 }}>
+              ⏱ Timing starts when first delivery is marked
+            </span>
           </div>
         )}
-      </nav>
-    </>
-  )
-}
 
-// ── Mobile top bar ──────────────────────────────────────────────
-function MobileTopBar({ active, activeCatMeta, onMenuOpen }) {
-  return (
-    <div style={{
-      position: 'sticky', top: 0, zIndex: 20,
-      background: BG1, borderBottom: `1px solid ${BORDER}`,
-      display: 'flex', alignItems: 'center', gap: 10,
-      padding: '12px 16px',
-    }}>
-      {/* Hamburger */}
-      <button
-        onClick={onMenuOpen}
-        style={{
-          background: '#0d2035', border: `1px solid ${BORDER}`,
-          borderRadius: 8, width: 38, height: 38, flexShrink: 0,
-          display: 'flex', flexDirection: 'column', alignItems: 'center',
-          justifyContent: 'center', gap: 4, cursor: 'pointer', padding: 0,
-        }}
-      >
-        {[0,1,2].map(i => (
-          <span key={i} style={{ display: 'block', width: 16, height: 1.5, background: ACCENT, borderRadius: 1 }} />
-        ))}
-      </button>
-
-      <div style={{ flex: 1, minWidth: 0 }}>
-        {activeCatMeta && (
-          <div style={{ fontSize: 9, fontWeight: 600, letterSpacing: '0.1em', textTransform: 'uppercase', color: activeCatMeta.color, marginBottom: 2 }}>
-            {activeCatMeta.label}
+        {/* Global est total (shown separately once we have a rate) */}
+        {globalEstTotalMin > 0 && (
+          <div style={{ marginTop:4, textAlign:"center" }}>
+            <span style={{ color:"rgba(255,255,255,.4)", fontSize:10 }}>
+              Est total operation: <span style={{ color:"rgba(255,255,255,.7)", fontWeight:600 }}>
+                {fmtDuration(globalEstTotalMin)}
+              </span>
+              {" · "}Est finish: <span style={{ color:"rgba(255,255,255,.7)", fontWeight:600 }}>
+                {fmtTime(new Date(firstStartedAt.getTime() + globalEstTotalMin * 60000).toISOString())}
+              </span>
+            </span>
           </div>
         )}
-        <div style={{ fontSize: 14, fontWeight: 500, color: TEXT_HI, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {active ? active.title : 'Chart Gallery'}
-        </div>
+      </header>
+
+      {/* Tabs */}
+      <div style={{ background:"#fff", borderBottom:"1px solid #e5e7eb",
+                    display:"flex", padding:"0 20px", gap:4 }}>
+        {[["routes","🚛 Routes"],["pickups","🏠 Pickups"],["drivers","👥 Drivers"],["qr","📱 QR Codes"]].map(([k,l]) => (
+          <button key={k} onClick={() => setActiveTab(k)}
+            style={{ padding:"12px 16px", border:"none", background:"none", fontSize:13,
+                     fontWeight: activeTab===k ? 700 : 400,
+                     color: activeTab===k ? "#1a3a2a" : "#6b7280",
+                     borderBottom: activeTab===k ? "2px solid #1a3a2a" : "2px solid transparent" }}>
+            {l}
+          </button>
+        ))}
       </div>
 
-      {/* Roberts Vision wordmark */}
-      <div style={{ fontSize: 9, fontWeight: 600, color: '#3a6a9a', letterSpacing: '0.12em', textTransform: 'uppercase', flexShrink: 0 }}>
-        RV
-      </div>
-    </div>
-  )
-}
+      <div style={{ flex:1, overflow:"auto", padding:16 }}>
 
-// ── Mobile bottom drawer ────────────────────────────────────────
-function MobileDrawer({ open, onClose, grouped, activeId, onSelect, search, setSearch }) {
-  // Trap scroll when open
-  useEffect(() => {
-    document.body.style.overflow = open ? 'hidden' : ''
-    return () => { document.body.style.overflow = '' }
-  }, [open])
+        {/* Drivers tab */}
+        {activeTab === "drivers" && (
+          <DriversTab
+            drivers={drivers}
+            routes={routes}
+            onUpload={handleCsvUpload}
+            onClear={() => { setDrivers([]); localStorage.removeItem(DRIVERS_KEY); }}
+          />
+        )}
 
-  return (
-    <>
-      {/* Backdrop */}
-      <div
-        onClick={onClose}
-        style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
-          zIndex: 40, opacity: open ? 1 : 0,
-          pointerEvents: open ? 'auto' : 'none',
-          transition: 'opacity 0.25s',
-        }}
-      />
-      {/* Sheet */}
-      <div style={{
-        position: 'fixed', left: 0, right: 0, bottom: 0,
-        height: '75vh', background: BG1,
-        borderRadius: '18px 18px 0 0', border: `1px solid ${BORDER}`,
-        zIndex: 50, display: 'flex', flexDirection: 'column',
-        transform: open ? 'translateY(0)' : 'translateY(100%)',
-        transition: 'transform 0.3s cubic-bezier(0.4,0,0.2,1)',
-        boxShadow: '0 -8px 40px rgba(0,0,0,0.5)',
-      }}>
-        {/* Drag handle + header */}
-        <div style={{ padding: '12px 16px 10px', borderBottom: `1px solid ${BORDER}`, flexShrink: 0 }}>
-          <div style={{ width: 36, height: 4, background: '#1a3050', borderRadius: 2, margin: '0 auto 12px' }} />
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div>
-              <div style={{ fontSize: 10, fontWeight: 600, color: '#3a6a9a', letterSpacing: '0.14em', textTransform: 'uppercase' }}>Roberts Vision</div>
-              <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_HI }}>Chart Gallery</div>
+        {/* QR tab */}
+        {activeTab === "qr" && (
+          <div>
+            <p style={{ color:"#6b7280", fontSize:13, marginBottom:16 }}>
+              Each QR code links directly to that vehicle's route. Print and hand to drivers.
+            </p>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))", gap:12 }}>
+              {routes.map(r => (
+                <div key={r.id} style={{ background:"#fff", border:"1px solid #e5e7eb",
+                                         borderRadius:10, padding:16, textAlign:"center" }}>
+                  <p style={{ fontWeight:700, fontSize:13, marginBottom:4 }}>{r.vehicle}</p>
+                  <p style={{ fontSize:11, color:"#6b7280", marginBottom:10 }}>{r.shift}</p>
+                  <img
+                    src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(appUrl(r.id))}`}
+                    alt="QR" style={{ width:150, height:150, borderRadius:6 }}
+                  />
+                  <p style={{ fontSize:10, color:"#9ca3af", marginTop:8, wordBreak:"break-all" }}>
+                    {r.driver_name || "Unassigned"}
+                  </p>
+                  <a href={appUrl(r.id)} target="_blank" rel="noreferrer"
+                    style={{ display:"block", marginTop:8, fontSize:11, color:"#2563eb" }}>
+                    Open Route →
+                  </a>
+                </div>
+              ))}
             </div>
-            <button
-              onClick={onClose}
-              style={{ background: '#0d2035', border: `1px solid ${BORDER}`, borderRadius: 8, width: 34, height: 34, color: TEXT_MID, fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-            >✕</button>
           </div>
-        </div>
-        <ChartList
-          grouped={grouped} activeId={activeId}
-          onSelect={(id) => { onSelect(id); onClose(); }}
-          search={search} setSearch={setSearch} compact={true}
-        />
-      </div>
-    </>
-  )
-}
+        )}
 
-// ── Root ────────────────────────────────────────────────────────
-export default function App() {
-  const isMobile = useIsMobile()
-  const [activeId, setActiveId] = useState(CHARTS[0]?.id ?? null)
-  const [search, setSearch] = useState('')
-  const [drawerOpen, setDrawerOpen] = useState(false)
-
-  const filtered = useMemo(() => {
-    const q = search.toLowerCase().trim()
-    if (!q) return CHARTS
-    return CHARTS.filter(c =>
-      c.title.toLowerCase().includes(q) || c.category.toLowerCase().includes(q)
-    )
-  }, [search])
-
-  const grouped = useMemo(() => {
-    const map = {}
-    for (const cat of CATEGORIES) {
-      const charts = filtered.filter(c => c.category === cat.id)
-      if (charts.length) map[cat.id] = { ...cat, charts }
-    }
-    for (const chart of filtered) {
-      if (!map[chart.category]) {
-        map[chart.category] = {
-          id: chart.category,
-          label: chart.category.charAt(0).toUpperCase() + chart.category.slice(1),
-          color: '#a78bfa',
-          charts: filtered.filter(c => c.category === chart.category),
-        }
-      }
-    }
-    return map
-  }, [filtered])
-
-  const active = CHARTS.find(c => c.id === activeId)
-  const ActiveComponent = active?.component ?? null
-  const activeCatMeta = active
-    ? (CATEGORY_META[active.category] ?? { label: active.category, color: '#a78bfa' })
-    : null
-
-  // ── MOBILE ──────────────────────────────────────────────────
-  if (isMobile) {
-    return (
-      <div style={{ ...S.app, flexDirection: 'column', minHeight: '100vh' }}>
-        <MobileTopBar active={active} activeCatMeta={activeCatMeta} onMenuOpen={() => setDrawerOpen(true)} />
-
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          {active ? (
-            <>
-              <ActiveComponent />
-              <div style={{ ...S.hint, margin: '0 16px 28px', fontSize: 11 }}>
-                <strong style={{ color: ACCENT }}>To add a chart:</strong>{' '}
-                Drop a <span style={S.code}>.jsx</span> into <span style={S.code}>src/charts/&lt;category&gt;/</span>
-              </div>
-            </>
-          ) : (
-            <div style={S.empty}>
-              <div style={S.emptyText}>Tap ☰ to select a chart</div>
+        {/* Pickups tab */}
+        {activeTab === "pickups" && (
+          <div style={{ background:"#fff", borderRadius:10, border:"1px solid #e5e7eb", overflow:"hidden" }}>
+            <div style={{ background:"#1a3a2a", padding:"10px 16px", color:"#fff", fontWeight:700, fontSize:14 }}>
+              🏠 Pickup Orders — AEHS: 11135 Newport Mill Rd, Kensington MD
             </div>
-          )}
-        </div>
-
-        <MobileDrawer
-          open={drawerOpen}
-          onClose={() => setDrawerOpen(false)}
-          grouped={grouped}
-          activeId={activeId}
-          onSelect={setActiveId}
-          search={search}
-          setSearch={setSearch}
-        />
-      </div>
-    )
-  }
-
-  // ── DESKTOP ──────────────────────────────────────────────────
-  return (
-    <div style={S.app}>
-      <aside style={S.sidebar}>
-        <div style={S.sidebarHeader}>
-          <div style={S.wordmark}>Roberts Vision</div>
-          <div style={S.sidebarTitle}>Chart Gallery</div>
-          <div style={S.sidebarSubtitle}>
-            {CHARTS.length} chart{CHARTS.length !== 1 ? 's' : ''} · {CATEGORIES.length} categor{CATEGORIES.length !== 1 ? 'ies' : 'y'}
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead>
+                <tr style={{ background:"#f9fafb" }}>
+                  {["Name","Phone","Email","Bags","Status","Action"].map(h => (
+                    <th key={h} style={{ padding:"8px 12px", textAlign:"left", fontSize:11,
+                                         fontWeight:700, color:"#6b7280", textTransform:"uppercase",
+                                         letterSpacing:.5, borderBottom:"1px solid #e5e7eb" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {pickups.map(p => (
+                  <tr key={p.id} style={{ background: p.checked_out ? "#f0fdf4" : "#fff" }}>
+                    <td style={{ padding:"10px 12px", fontWeight:600, borderBottom:"1px solid #f3f4f6" }}>{p.name}</td>
+                    <td style={{ padding:"10px 12px", borderBottom:"1px solid #f3f4f6" }}>{p.phone || "—"}</td>
+                    <td style={{ padding:"10px 12px", borderBottom:"1px solid #f3f4f6" }}>
+                      <a href={`mailto:${p.email}`} style={{ color:"#2563eb" }}>{p.email}</a>
+                    </td>
+                    <td style={{ padding:"10px 12px", fontFamily:"'DM Mono',monospace", fontWeight:600,
+                                  color:"#1a3a2a", borderBottom:"1px solid #f3f4f6" }}>{p.bags}</td>
+                    <td style={{ padding:"10px 12px", borderBottom:"1px solid #f3f4f6" }}>
+                      <span style={{ background: p.checked_out ? "#dcfce7" : "#f3f4f6",
+                                     color: p.checked_out ? "#16a34a" : "#6b7280",
+                                     padding:"2px 8px", borderRadius:10, fontSize:11, fontWeight:600 }}>
+                        {p.checked_out ? "✓ Picked Up" : "Waiting"}
+                      </span>
+                    </td>
+                    <td style={{ padding:"10px 12px", borderBottom:"1px solid #f3f4f6" }}>
+                      <div style={{ display:"flex", gap:6 }}>
+                        {!p.checked_out ? (
+                          <button onClick={async () => {
+                              await sbPatch("pickup_orders",
+                                { checked_out: true, checked_out_at: new Date().toISOString(), checked_out_by: "Manager" },
+                                { id: `eq.${p.id}` });
+                              onReload();
+                            }}
+                            style={{ background:"#1a3a2a", color:"#fff", border:"none",
+                                     borderRadius:6, padding:"4px 10px", fontSize:12, fontWeight:600 }}>
+                            Mark Picked Up
+                          </button>
+                        ) : (
+                          <button onClick={async () => {
+                              if (!window.confirm(`Reset pickup for ${p.name}?`)) return;
+                              await sbPatch("pickup_orders",
+                                { checked_out: false, checked_out_at: null, checked_out_by: null },
+                                { id: `eq.${p.id}` });
+                              onReload();
+                            }}
+                            style={{ background:"#fee2e2", color:"#dc2626", border:"1px solid #fca5a5",
+                                     borderRadius:6, padding:"4px 10px", fontSize:12, fontWeight:600 }}>
+                            ↺ Reset
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        </div>
-        <ChartList
-          grouped={grouped} activeId={activeId}
-          onSelect={setActiveId}
-          search={search} setSearch={setSearch}
-        />
-      </aside>
+        )}
 
-      <main style={S.main}>
-        {active ? (
+        {/* Routes tab */}
+        {activeTab === "routes" && (
           <>
-            <div style={S.topBar}>
-              {activeCatMeta && <span style={S.catBadge(activeCatMeta.color)}>{activeCatMeta.label}</span>}
-              <span style={S.topBarTitle}>{active.title}</span>
+            {/* Shift tabs + print button */}
+            <div style={{ display:"flex", gap:8, marginBottom:16, alignItems:"stretch" }}>
+              {SHIFTS.map((s, i) => {
+                const sr = routes.filter(r => r.shift_num === i+1);
+                const done = sr.filter(r => r.status === "complete").length;
+                return (
+                  <button key={i} onClick={() => setActiveShift(i)}
+                    style={{ flex:1, padding:"10px 8px", border:"2px solid",
+                             borderColor: activeShift===i ? SHIFT_COLORS[i] : "#e5e7eb",
+                             borderRadius:10, background: activeShift===i ? SHIFT_COLORS[i] : "#fff",
+                             color: activeShift===i ? "#fff" : "#374151",
+                             fontWeight:600, fontSize:13, transition:"all .15s" }}>
+                    <div>{s.split(" ")[0]} {s.split(" ")[1]}</div>
+                    <div style={{ fontSize:11, opacity:.8, fontWeight:400, marginTop:2 }}>
+                      {sr.length} routes · {done} done
+                    </div>
+                  </button>
+                );
+              })}
+              <button onClick={printShiftRoutes} disabled={printing}
+                style={{ padding:"10px 14px", border:`2px solid ${SHIFT_COLORS[activeShift]}`, borderRadius:10,
+                         background: printing ? "#e5e7eb" : SHIFT_COLORS[activeShift], color:"#fff",
+                         fontWeight:600, fontSize:13, cursor: printing ? "default" : "pointer",
+                         whiteSpace:"nowrap", flexShrink:0 }}>
+                {printing ? "⏳ Loading…" : `🖨️ Print Shift ${activeShift + 1}`}
+              </button>
             </div>
-            <div style={S.content}>
-              <ActiveComponent />
-              <div style={S.hint}>
-                <strong style={{ color: ACCENT }}>To add or rename a chart</strong><br />
-                Drop any <span style={S.code}>.jsx</span> into <span style={S.code}>src/charts/&lt;category&gt;/</span> — the filename is the title.
-                Rename the file → title updates. Move it → category changes. No other edits needed.
-              </div>
+
+            {/* Route cards */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))", gap:12 }}>
+              {shiftRoutes.map(r => (
+                <RouteCard key={r.id} route={r}
+                  liveStops={stopsByRoute[r.id] || []}
+                  now={now}
+                  onAssign={() => { setEditingRoute(r.id); setDriverName(r.driver_name || ""); }}
+                  onQr={() => showQr(r)}
+                  onPrint={() => printSingleRoute(r)}
+                  onMarkComplete={() => markRouteComplete(r.id)}
+                  onResetRoute={() => resetRoute(r.id)}
+                  appUrl={appUrl(r.id)}
+                />
+              ))}
             </div>
           </>
-        ) : (
-          <div style={S.empty}>
-            <div style={S.emptyText}>Select a chart from the sidebar</div>
+        )}
+      </div>
+
+      {/* QR Code modal */}
+      {qrRoute && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.6)", zIndex:200,
+                      display:"flex", alignItems:"center", justifyContent:"center" }}
+             onClick={() => setQrRoute(null)}>
+          <div onClick={e => e.stopPropagation()}
+               style={{ background:"#fff", borderRadius:16, padding:32, width:300,
+                        textAlign:"center", boxShadow:"0 20px 60px rgba(0,0,0,.3)" }}>
+            <div style={{ fontWeight:700, fontSize:16, marginBottom:4 }}>{qrRoute.vehicle}</div>
+            <div style={{ fontSize:12, color:"#6b7280", marginBottom:20 }}>{qrRoute.shift}</div>
+            <img
+              src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(appUrl(qrRoute.id))}`}
+              alt="QR Code" style={{ width:200, height:200, borderRadius:8, marginBottom:16 }}
+            />
+            <a href={appUrl(qrRoute.id)} target="_blank" rel="noreferrer"
+               style={{ display:"block", fontSize:11, color:"#2563eb", marginBottom:20,
+                        wordBreak:"break-all", textDecoration:"underline" }}>
+              {appUrl(qrRoute.id)}
+            </a>
+            <button onClick={() => setQrRoute(null)}
+              style={{ width:"100%", height:40, background:"#1a3a2a", color:"#fff",
+                       border:"none", borderRadius:8, fontSize:14, fontWeight:600 }}>
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+      {/* Auto-assign prompt */}
+      {autoAssignPrompt && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.55)", zIndex:300,
+                      display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}
+             onClick={() => setAutoAssignPrompt(null)}>
+          <div onClick={e => e.stopPropagation()}
+               style={{ background:"#fff", borderRadius:16, padding:28, width:380, maxWidth:"100%",
+                        boxShadow:"0 20px 60px rgba(0,0,0,.3)" }}>
+            <div style={{ fontSize:28, textAlign:"center", marginBottom:10 }}>👥</div>
+            <h3 style={{ fontSize:17, fontWeight:700, marginBottom:8, textAlign:"center" }}>
+              {autoAssignPrompt.length} Drivers Loaded
+            </h3>
+            <p style={{ fontSize:13, color:"#6b7280", marginBottom:16, textAlign:"center", lineHeight:1.5 }}>
+              Auto-assign drivers to unassigned routes based on their vehicle type and shift?
+            </p>
+            <div style={{ background:"#f9fafb", borderRadius:10, padding:"10px 14px", marginBottom:20,
+                          fontSize:12, color:"#374151", lineHeight:1.9 }}>
+              {autoAssignPrompt.slice(0, 8).map(d => (
+                <div key={d.id} style={{ display:"flex", justifyContent:"space-between" }}>
+                  <span style={{ fontWeight:600 }}>{d.firstName} {d.lastName}</span>
+                  <span style={{ color:"#9ca3af" }}>
+                    {d.signups.map(s => `S${s.shift_num} ${s.vehicleType}`).join(", ")}
+                  </span>
+                </div>
+              ))}
+              {autoAssignPrompt.length > 8 && (
+                <div style={{ color:"#9ca3af", fontStyle:"italic" }}>…and {autoAssignPrompt.length - 8} more</div>
+              )}
+            </div>
+            <div style={{ display:"flex", gap:10 }}>
+              <button onClick={() => { commitDrivers(autoAssignPrompt); setAutoAssignPrompt(null); }}
+                style={{ flex:1, height:42, border:"1px solid #e5e7eb", borderRadius:10,
+                         background:"#f9fafb", fontSize:13, fontWeight:500, color:"#374151" }}>
+                No, Assign Manually
+              </button>
+              <button onClick={() => { commitDrivers(autoAssignPrompt); performAutoAssign(autoAssignPrompt); setAutoAssignPrompt(null); }}
+                disabled={autoAssigning}
+                style={{ flex:1, height:42, background:"#1a3a2a", color:"#fff",
+                         border:"none", borderRadius:10, fontSize:13, fontWeight:700 }}>
+                {autoAssigning ? "Assigning…" : "✓ Yes, Auto-Assign"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Assign driver modal */}
+      {editingRoute && (() => {
+        const routeObj = routes.find(r => r.id === editingRoute);
+        const vType = routeObj ? getVehicleType(routeObj.vehicle) : null;
+        const filteredDrivers = routeObj
+          ? drivers.filter(d => d.signups.some(s =>
+              s.shift_num === routeObj.shift_num && s.vehicleType === vType))
+          : [];
+        const alreadyAssigned = new Set(routes.map(r => r.driver_name).filter(Boolean));
+        const tripCount = routeObj
+          ? routes.filter(r => getVehicleBase(r.vehicle) === getVehicleBase(routeObj.vehicle) && r.shift_num === routeObj.shift_num).length
+          : 1;
+        return (
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.5)", zIndex:200,
+                        display:"flex", alignItems:"center", justifyContent:"center", padding:16 }}
+               onClick={() => { setEditingRoute(null); setSelectedDriverId(null); setDriverName(""); }}>
+            <div onClick={e => e.stopPropagation()}
+                 style={{ background:"#fff", borderRadius:14, padding:24, width:360, maxWidth:"100%",
+                          maxHeight:"85vh", overflowY:"auto",
+                          boxShadow:"0 20px 60px rgba(0,0,0,.3)" }}>
+              <h3 style={{ marginBottom:4, fontSize:15, fontWeight:700 }}>Assign Driver</h3>
+              {routeObj && (
+                <div style={{ fontSize:12, color:"#6b7280", marginBottom:16 }}>
+                  <span style={{ background:"#f3f4f6", borderRadius:6, padding:"2px 8px",
+                                  fontFamily:"'DM Mono',monospace", fontWeight:600, fontSize:11, marginRight:6 }}>
+                    {getVehicleBase(routeObj.vehicle)}
+                  </span>
+                  {routeObj.shift} · {vType === "van" ? "🚐 Van" : "🚛 Truck"}
+                </div>
+              )}
+
+              {filteredDrivers.length > 0 && (
+                <div style={{ marginBottom:14 }}>
+                  <div style={{ fontSize:11, fontWeight:700, color:"#6b7280", textTransform:"uppercase",
+                                letterSpacing:.5, marginBottom:8 }}>
+                    Signed up · {vType} · Shift {routeObj?.shift_num}
+                  </div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                    {filteredDrivers.map(d => {
+                      const fullName = `${d.firstName} ${d.lastName}`;
+                      const isSelected = selectedDriverId === d.id;
+                      const isAssigned = alreadyAssigned.has(fullName);
+                      const sport = d.signups.find(s =>
+                        s.shift_num === routeObj?.shift_num && s.vehicleType === vType)?.sport || "";
+                      return (
+                        <button key={d.id}
+                          onClick={() => { setSelectedDriverId(d.id); setDriverName(fullName); }}
+                          style={{ padding:"10px 12px", border:`2px solid ${isSelected ? "#1a3a2a" : "#e5e7eb"}`,
+                                   borderRadius:10, background: isSelected ? "#f0fdf4" : "#fff",
+                                   textAlign:"left", cursor:"pointer", width:"100%" }}>
+                          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                            <div style={{ flex:1, minWidth:0 }}>
+                              <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                                <span style={{ fontWeight:700, fontSize:14 }}>{fullName}</span>
+                                {isAssigned && (
+                                  <span style={{ background:"#fef3c7", color:"#92400e",
+                                                  fontSize:10, padding:"1px 6px", borderRadius:8, fontWeight:600 }}>
+                                    Already assigned
+                                  </span>
+                                )}
+                              </div>
+                              {d.phone && <div style={{ fontSize:11, color:"#6b7280", marginTop:2 }}>📞 {d.phone}</div>}
+                              {sport && <div style={{ fontSize:11, color:"#2563eb", marginTop:1 }}>🏅 {sport.substring(0,55)}{sport.length>55?"…":""}</div>}
+                            </div>
+                            {isSelected && <span style={{ color:"#1a3a2a", fontSize:18, flexShrink:0 }}>✓</span>}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {filteredDrivers.length === 0 && drivers.length > 0 && (
+                <div style={{ padding:"10px 14px", background:"#fffbeb", border:"1px solid #fde68a",
+                              borderRadius:8, fontSize:12, color:"#92400e", marginBottom:14 }}>
+                  No roster drivers match this shift & vehicle type.
+                </div>
+              )}
+
+              <div style={{ fontSize:11, fontWeight:700, color:"#6b7280", textTransform:"uppercase",
+                            letterSpacing:.5, marginBottom:6 }}>
+                {filteredDrivers.length > 0 ? "Or type a name" : "Driver name"}
+              </div>
+              <input value={driverName}
+                onChange={e => { setDriverName(e.target.value); setSelectedDriverId(null); }}
+                placeholder="Driver name"
+                style={{ width:"100%", height:42, padding:"0 12px", border:"1px solid #e5e7eb",
+                         borderRadius:8, fontSize:14, outline:"none", marginBottom:10 }} />
+
+              {tripCount > 1 && (
+                <div style={{ fontSize:11, color:"#9ca3af", marginBottom:12 }}>
+                  ℹ️ Will assign to all <strong style={{ color:"#374151" }}>{tripCount} trips</strong> for this vehicle this shift
+                </div>
+              )}
+
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={() => { setEditingRoute(null); setSelectedDriverId(null); setDriverName(""); }}
+                  style={{ flex:1, height:40, border:"1px solid #e5e7eb", borderRadius:8,
+                           background:"#fff", fontSize:14 }}>Cancel</button>
+                <button onClick={assignDriver} disabled={saving || !driverName.trim()}
+                  style={{ flex:1, height:40, background: driverName.trim() ? "#1a3a2a" : "#d1d5db",
+                           color:"#fff", border:"none", borderRadius:8, fontSize:14, fontWeight:600 }}>
+                  {saving ? "Saving..." : "Assign"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+    </div>
+  );
+}
+
+// ── Drivers Tab ──────────────────────────────────────────────────────────────
+function DriversTab({ drivers, routes, onUpload, onClear }) {
+  const fileRef = useRef(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  const handleFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => onUpload(e.target.result);
+    reader.readAsText(file);
+  };
+
+  const SHIFT_LABELS = { 1: "Shift 1 (7:30)", 2: "Shift 2 (10:30)", 3: "Shift 3 (1:30)" };
+
+  // Build assignment map from routes
+  const assignmentMap = {};
+  for (const r of routes) {
+    if (r.driver_name) assignmentMap[r.driver_name] = r;
+  }
+
+  return (
+    <div>
+      {/* Upload zone */}
+      <div
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={e => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); }}
+        style={{ border:`2px dashed ${dragOver ? "#1a3a2a" : "#d1d5db"}`,
+                 borderRadius:12, padding:"28px 20px", textAlign:"center",
+                 background: dragOver ? "#f0fdf4" : "#fff", marginBottom:16,
+                 transition:"all .15s", cursor:"pointer" }}
+        onClick={() => fileRef.current?.click()}>
+        <input ref={fileRef} type="file" accept=".csv"
+          style={{ display:"none" }}
+          onChange={e => handleFile(e.target.files[0])} />
+        <div style={{ fontSize:32, marginBottom:8 }}>📋</div>
+        <div style={{ fontWeight:700, fontSize:14, color:"#1a3a2a", marginBottom:4 }}>
+          Upload SignUpGenius CSV
+        </div>
+        <div style={{ fontSize:12, color:"#9ca3af" }}>
+          Drop file here or click to browse
+        </div>
+      </div>
+
+      {/* Roster */}
+      {drivers.length > 0 ? (
+        <>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+            <div style={{ fontWeight:700, fontSize:14, color:"#111827" }}>
+              {drivers.length} Drivers in Roster
+            </div>
+            <button onClick={() => { if (window.confirm("Clear driver roster?")) onClear(); }}
+              style={{ background:"#fee2e2", color:"#dc2626", border:"1px solid #fca5a5",
+                       borderRadius:6, padding:"4px 12px", fontSize:12, fontWeight:600, cursor:"pointer" }}>
+              Clear Roster
+            </button>
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+            {drivers.map(d => {
+              const fullName = `${d.firstName} ${d.lastName}`;
+              const assigned = assignmentMap[fullName];
+              return (
+                <div key={d.id}
+                     style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:10,
+                              padding:"12px 14px", display:"flex", gap:10, alignItems:"flex-start" }}>
+                  <div style={{ width:36, height:36, borderRadius:"50%", flexShrink:0,
+                                 background: assigned ? "#dcfce7" : "#f3f4f6",
+                                 display:"flex", alignItems:"center", justifyContent:"center",
+                                 fontSize:14, fontWeight:700, color: assigned ? "#15803d" : "#6b7280" }}>
+                    {d.firstName[0]}{d.lastName[0]}
+                  </div>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontWeight:700, fontSize:14 }}>{fullName}
+                      {assigned && (
+                        <span style={{ marginLeft:8, background:"#dcfce7", color:"#15803d",
+                                        fontSize:10, padding:"1px 7px", borderRadius:8, fontWeight:600 }}>
+                          ✓ Assigned — {assigned.vehicle}
+                        </span>
+                      )}
+                    </div>
+                    {d.email && <div style={{ fontSize:11, color:"#6b7280", marginTop:1 }}>{d.email}</div>}
+                    {d.phone && <div style={{ fontSize:11, color:"#374151", marginTop:1 }}>📞 {d.phone}</div>}
+                    <div style={{ display:"flex", flexWrap:"wrap", gap:4, marginTop:6 }}>
+                      {d.signups.map((s, i) => (
+                        <span key={i}
+                              style={{ background: s.vehicleType === "van" ? "#eff6ff" : "#f0fdf4",
+                                       color: s.vehicleType === "van" ? "#1d4ed8" : "#15803d",
+                                       border:`1px solid ${s.vehicleType === "van" ? "#bfdbfe" : "#bbf7d0"}`,
+                                       fontSize:10, padding:"2px 8px", borderRadius:10, fontWeight:600 }}>
+                          {s.vehicleType === "van" ? "🚐" : "🚛"} {SHIFT_LABELS[s.shift_num]}
+                        </span>
+                      ))}
+                    </div>
+                    {d.signups[0]?.sport && (
+                      <div style={{ fontSize:11, color:"#6b7280", marginTop:4, fontStyle:"italic" }}>
+                        {d.signups[0].sport.substring(0, 80)}{d.signups[0].sport.length > 80 ? "…" : ""}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <div style={{ textAlign:"center", padding:"32px 20px", color:"#9ca3af", fontSize:13 }}>
+          No drivers loaded yet. Upload a SignUpGenius CSV to get started.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Route Card ────────────────────────────────────────────────────────────────
+function RouteCard({ route, liveStops, now, onAssign, onQr, onPrint, onMarkComplete, onResetRoute, appUrl }) {
+  const [expanded, setExpanded] = useState(false);
+  const [stops, setStops]       = useState([]);
+  const [completing, setCompleting] = useState(false);
+  const [resetting, setResetting]   = useState(false);
+
+  // Live progress from parent-supplied stop statuses
+  const liveDelivered = liveStops.filter(s => s.status === "delivered" || s.status === "skipped").length;
+  const liveTotal     = liveStops.length || route.total_stops;
+  const liveProgress  = liveTotal > 0 ? Math.round(liveDelivered / liveTotal * 100) : 0;
+  const isActive      = liveDelivered > 0 && liveDelivered < liveTotal;
+
+  // ── Per-route timing ──────────────────────────────────────────────────────
+  const startedAt     = route.started_at ? new Date(route.started_at) : null;
+  const elapsedMin    = startedAt ? (now - startedAt.getTime()) / 60000 : 0;
+  const rate          = elapsedMin > 0 && liveDelivered > 0 ? liveDelivered / elapsedMin : 0; // stops/min
+  const estTotalMin   = rate > 0 ? liveTotal / rate : 0;
+  const estRemMin     = rate > 0 ? Math.max(0, (liveTotal - liveDelivered) / rate) : 0;
+  const estFinishTime = startedAt && estTotalMin > 0
+    ? new Date(startedAt.getTime() + estTotalMin * 60000)
+    : null;
+
+  const loadStops = async () => {
+    if (!expanded) {
+      const s = await sbGet("stops", { select:"*", route_id:`eq.${route.id}`, order:"stop_num.asc" });
+      setStops(s || []);
+    }
+    setExpanded(e => !e);
+  };
+
+  const handleMarkComplete = async () => {
+    if (!window.confirm(`Mark ${route.vehicle} as complete? This will mark all stops delivered.`)) return;
+    setCompleting(true);
+    await onMarkComplete();
+    setCompleting(false);
+  };
+
+  const handleReset = async () => {
+    if (!window.confirm(`Reset ${route.vehicle}? This will clear the driver and mark all stops pending.`)) return;
+    setResetting(true);
+    await onResetRoute();
+    setStops([]);
+    setExpanded(false);
+    setResetting(false);
+  };
+
+  return (
+    <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:10,
+                  overflow:"hidden", boxShadow:"0 1px 3px rgba(0,0,0,.06)" }}>
+      <div style={{ padding:"12px 14px" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:8 }}>
+          <div>
+            <div style={{ fontFamily:"'DM Mono',monospace", fontWeight:700, fontSize:13, color:"#111827" }}>
+              {route.vehicle}
+            </div>
+            {route.driver_name && (
+              <div style={{ fontSize:12, color:"#4b5563", marginTop:2 }}>👤 {route.driver_name}</div>
+            )}
+          </div>
+          <span style={{ background: statusColor(route.status) + "20",
+                         color: statusColor(route.status),
+                         padding:"2px 8px", borderRadius:10, fontSize:11, fontWeight:700 }}>
+            {statusLabel(route.status)}
+          </span>
+        </div>
+
+        <div style={{ display:"flex", gap:8, marginBottom:10 }}>
+          {[[route.total_stops, "stops"], [route.total_bags, "bags"]].map(([v,l]) => (
+            <div key={l} style={{ background:"#f3f4f6", borderRadius:6, padding:"4px 8px",
+                                   fontFamily:"'DM Mono',monospace", fontSize:12 }}>
+              <strong>{v}</strong> {l}
+            </div>
+          ))}
+          {route.est_minutes && (() => {
+            const h = Math.floor(route.est_minutes / 60);
+            const m = Math.round(route.est_minutes % 60);
+            const label = h > 0 ? `~${h}h ${m}m` : `~${m}m`;
+            return (
+              <div style={{ background:"#eff6ff", borderRadius:6, padding:"4px 8px",
+                             fontFamily:"'DM Mono',monospace", fontSize:12, color:"#2563eb" }}>
+                <strong>{label}</strong>
+              </div>
+            );
+          })()}
+        </div>
+
+        {/* Always-visible live progress bar */}
+        {liveTotal > 0 && (
+          <div style={{ marginBottom: startedAt ? 6 : 10 }}>
+            <div style={{ height:5, background:"#e5e7eb", borderRadius:3, marginBottom:4, overflow:"hidden" }}>
+              <div style={{
+                height:"100%", borderRadius:3, transition:"width .4s",
+                background: liveProgress === 100 ? "#16a34a" : isActive ? "#f59e0b" : "#d1d5db",
+                width:`${liveProgress}%`
+              }} />
+            </div>
+            <div style={{ fontSize:11, color: liveProgress === 100 ? "#16a34a" : isActive ? "#d97706" : "#9ca3af",
+                          fontWeight: liveDelivered > 0 ? 600 : 400 }}>
+              {liveDelivered}/{liveTotal} stops done
+              {liveProgress === 100 ? " ✓" : ""}
+            </div>
           </div>
         )}
-      </main>
+
+        {/* Per-route timing row */}
+        {startedAt && liveDelivered > 0 && (
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:4, marginBottom:10 }}>
+            <div style={{ background:"#f0fdf4", borderRadius:5, padding:"4px 6px", textAlign:"center" }}>
+              <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:.3 }}>Started</div>
+              <div style={{ fontSize:11, fontWeight:700, color:"#1a3a2a", fontFamily:"'DM Mono',monospace" }}>
+                {fmtTime(route.started_at)}
+              </div>
+            </div>
+            <div style={{ background:"#fffbeb", borderRadius:5, padding:"4px 6px", textAlign:"center" }}>
+              <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:.3 }}>Elapsed</div>
+              <div style={{ fontSize:11, fontWeight:700, color:"#92400e", fontFamily:"'DM Mono',monospace" }}>
+                {fmtDuration(elapsedMin)}
+              </div>
+            </div>
+            <div style={{ background: liveProgress === 100 ? "#f0fdf4" : "#fef2f2", borderRadius:5, padding:"4px 6px", textAlign:"center" }}>
+              <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:.3 }}>
+                {liveProgress === 100 ? "Finished" : "Est Left"}
+              </div>
+              <div style={{ fontSize:11, fontWeight:700,
+                             color: liveProgress === 100 ? "#16a34a" : "#dc2626",
+                             fontFamily:"'DM Mono',monospace" }}>
+                {liveProgress === 100
+                  ? fmtTime(route.completed_at)
+                  : estRemMin > 0 ? fmtDuration(estRemMin) : "—"}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Est finish time (only when in progress with enough data) */}
+        {startedAt && liveDelivered > 0 && liveProgress < 100 && estFinishTime && (
+          <div style={{ marginBottom:10, fontSize:11, color:"#6b7280", textAlign:"center" }}>
+            Est finish: <span style={{ fontWeight:600, color:"#374151" }}>{fmtTime(estFinishTime.toISOString())}</span>
+            {" · "}Est total: <span style={{ fontWeight:600, color:"#374151" }}>{fmtDuration(estTotalMin)}</span>
+          </div>
+        )}
+
+        <div style={{ display:"flex", gap:6 }}>
+          <button onClick={onAssign}
+            style={{ flex:1, height:32, background:"#1a6b3a", border:"none", borderRadius:6, fontSize:12, fontWeight:600, color:"#fff", cursor:"pointer", WebkitAppearance:"none" }}>
+            {route.driver_name ? "✏️ Reassign" : "👤 Assign"}
+          </button>
+          <button onClick={loadStops}
+            style={{ flex:1, height:32, background:"#2d8a56", border:"none", borderRadius:6, fontSize:12, fontWeight:600, color:"#fff", cursor:"pointer", WebkitAppearance:"none" }}>
+            {expanded ? "▲ Collapse" : "▼ Stops"}
+          </button>
+          {route.status !== "complete" && (
+            <button onClick={handleMarkComplete} disabled={completing}
+              style={{ flex:1, height:32, background: completing ? "#9ca3af" : "#15803d", border:"none",
+                       borderRadius:6, fontSize:12, fontWeight:600, color:"#fff", cursor:"pointer", WebkitAppearance:"none" }}
+              title="Mark entire route complete">
+              {completing ? "…" : "✓ Done"}
+            </button>
+          )}
+          {route.status !== "unassigned" && (
+            <button onClick={handleReset} disabled={resetting}
+              style={{ height:32, width:32, background: resetting ? "#9ca3af" : "#fee2e2", border:"1px solid #fca5a5",
+                       borderRadius:6, fontSize:13, cursor:"pointer", color:"#dc2626", WebkitAppearance:"none" }}
+              title="Reset this route">
+              {resetting ? "…" : "↺"}
+            </button>
+          )}
+          <button onClick={onPrint}
+            style={{ height:32, width:32, background:"#3aa86e", border:"none", borderRadius:6, fontSize:16, cursor:"pointer", color:"#fff", WebkitAppearance:"none", display:"flex", alignItems:"center", justifyContent:"center" }}
+            title="Print route sheet">
+            🖨️
+          </button>
+          <button onClick={onQr}
+            style={{ height:32, width:32, background:"#52c98a", border:"none", borderRadius:6, cursor:"pointer", color:"#fff", WebkitAppearance:"none", display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:700, letterSpacing:0.5 }}
+            title="Show QR code">
+            QR
+          </button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div style={{ borderTop:"1px solid #f3f4f6", maxHeight:300, overflowY:"auto" }}>
+          {stops.map(s => (
+            <div key={s.id} style={{ padding:"8px 14px", borderBottom:"1px solid #f9fafb",
+                                      background: s.status==="delivered" ? "#f0fdf4" : "#fff",
+                                      display:"flex", gap:8, alignItems:"flex-start" }}>
+              <div style={{ width:20, height:20, borderRadius:"50%", flexShrink:0,
+                             background: s.status==="delivered" ? "#16a34a" : "#e5e7eb",
+                             color: s.status==="delivered" ? "#fff" : "#6b7280",
+                             display:"flex", alignItems:"center", justifyContent:"center",
+                             fontSize:10, fontWeight:700, marginTop:1 }}>
+                {s.stop_num}
+              </div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontWeight:600, fontSize:12, whiteSpace:"nowrap",
+                               overflow:"hidden", textOverflow:"ellipsis" }}>{s.name}</div>
+                <div style={{ fontSize:11, color:"#6b7280", whiteSpace:"nowrap",
+                               overflow:"hidden", textOverflow:"ellipsis" }}>
+                  {(s.address||"").replace(", USA","")}
+                </div>
+                {s.instructions && (
+                  <div style={{ fontSize:10, color:"#d97706", marginTop:2, fontStyle:"italic" }}>
+                    📋 {s.instructions.substring(0,70)}{s.instructions.length>70?"…":""}
+                  </div>
+                )}
+              </div>
+              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, fontWeight:700,
+                             color:"#1a3a2a", flexShrink:0 }}>{s.bags}bg</div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
-  )
+  );
+}
+
+// ── Driver View ───────────────────────────────────────────────────────────────
+function DriverView({ route, onReload }) {
+  const [stops, setStops]       = useState(route.stops || []);
+  const [activeStop, setActiveStop] = useState(null);
+  const [note, setNote]         = useState("");
+  const [saving, setSaving]     = useState(false);
+
+  const delivered = stops.filter(s => s.status === "delivered").length;
+  const progress  = stops.length ? Math.round(delivered / stops.length * 100) : 0;
+  const nextStop  = stops.find(s => s.status === "pending");
+
+  const markDelivered = async (stopId, status = "delivered") => {
+    setSaving(true);
+    try {
+      await sbPatch("stops",
+        { status, completed_at: new Date().toISOString(), driver_note: note || null },
+        { id: `eq.${stopId}` });
+      setStops(prev => prev.map(s =>
+        s.id === stopId ? { ...s, status, driver_note: note || null } : s
+      ));
+      setActiveStop(null); setNote("");
+
+      // Set started_at on first delivery regardless of assigned/unassigned state
+      if (route.status !== "in_progress" && route.status !== "complete") {
+        await sbPatch("routes", { status: "in_progress", started_at: new Date().toISOString() },
+                      { id: `eq.${route.id}` });
+        route.status = "in_progress"; // update local reference so complete check fires correctly
+      }
+      const updated = stops.map(s => s.id === stopId ? { ...s, status } : s);
+      if (updated.every(s => s.status !== "pending")) {
+        await sbPatch("routes", { status: "complete", completed_at: new Date().toISOString() },
+                      { id: `eq.${route.id}` });
+      }
+    } catch(e) { console.error(e); }
+    setSaving(false);
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#f4f6f8", maxWidth:480, margin:"0 auto" }}>
+      <style>{css}</style>
+
+      {/* Driver header */}
+      <div style={{ background:"#1a3a2a", padding:"14px 16px", position:"sticky", top:0, zIndex:10 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+          <div>
+            <div style={{ color:"#4ade80", fontSize:11, fontWeight:600, letterSpacing:.5, textTransform:"uppercase" }}>
+              {route.shift}
+            </div>
+            <div style={{ color:"#fff", fontWeight:700, fontSize:16 }}>{route.vehicle}</div>
+            {route.driver_name && (
+              <div style={{ color:"rgba(255,255,255,.6)", fontSize:12 }}>👤 {route.driver_name}</div>
+            )}
+          </div>
+          <div style={{ textAlign:"right", fontFamily:"'DM Mono',monospace" }}>
+            <div style={{ color:"#4ade80", fontSize:22, fontWeight:700 }}>{delivered}/{stops.length}</div>
+            <div style={{ color:"rgba(255,255,255,.5)", fontSize:11 }}>stops done</div>
+          </div>
+        </div>
+
+        {/* Progress bar */}
+        <div style={{ height:6, background:"rgba(255,255,255,.15)", borderRadius:3 }}>
+          <div style={{ height:"100%", background:"#4ade80", borderRadius:3,
+                         width:`${progress}%`, transition:"width .4s" }} />
+        </div>
+        <div style={{ display:"flex", justifyContent:"space-between", marginTop:4 }}>
+          <span style={{ color:"rgba(255,255,255,.5)", fontSize:11 }}>{progress}% complete</span>
+          <span style={{ color:"rgba(255,255,255,.5)", fontSize:11 }}>{route.total_bags} bags total</span>
+        </div>
+      </div>
+
+      {/* Open in Maps buttons */}
+      <div style={{ padding:"10px 12px", background:"#fff", borderBottom:"1px solid #e5e7eb",
+                    display:"flex", gap:8 }}>
+        <a href={fullRouteUrl(stops)} target="_blank" rel="noreferrer"
+           style={{ flex:1, height:36, background:"#4285f4", color:"#fff", border:"none",
+                    borderRadius:8, fontSize:12, fontWeight:600, display:"flex",
+                    alignItems:"center", justifyContent:"center", gap:6 }}>
+          🗺️ Google Maps
+        </a>
+        {nextStop && (
+          <a href={wazeUrl(nextStop.lat, nextStop.lng)} target="_blank" rel="noreferrer"
+             style={{ flex:1, height:36, background:"#33ccff", color:"#fff", border:"none",
+                      borderRadius:8, fontSize:12, fontWeight:600, display:"flex",
+                      alignItems:"center", justifyContent:"center", gap:6 }}>
+            🚗 Waze
+          </a>
+        )}
+        {nextStop && (
+          <a href={appleMapsUrl(nextStop.address)} target="_blank" rel="noreferrer"
+             style={{ flex:1, height:36, background:"#555", color:"#fff", border:"none",
+                      borderRadius:8, fontSize:12, fontWeight:600, display:"flex",
+                      alignItems:"center", justifyContent:"center", gap:6 }}>
+            🍎 Maps
+          </a>
+        )}
+      </div>
+
+      {/* Stop list */}
+      <div style={{ padding:12, display:"flex", flexDirection:"column", gap:8 }}>
+        {stops.map(stop => (
+          <div key={stop.id}
+               style={{ background:"#fff", borderRadius:12, border:"2px solid",
+                        borderColor: stop.status==="delivered" ? "#bbf7d0"
+                                   : stop.id === nextStop?.id ? "#1a3a2a" : "#e5e7eb",
+                        overflow:"hidden", opacity: stop.status==="delivered" ? .7 : 1 }}>
+            <div style={{ padding:"12px 14px" }}>
+              <div style={{ display:"flex", gap:10, alignItems:"flex-start" }}>
+                <div style={{ width:28, height:28, borderRadius:"50%", flexShrink:0,
+                               background: stop.status==="delivered" ? "#16a34a"
+                                          : stop.id === nextStop?.id ? "#1a3a2a" : "#e5e7eb",
+                               color: stop.status==="delivered" || stop.id===nextStop?.id ? "#fff" : "#6b7280",
+                               display:"flex", alignItems:"center", justifyContent:"center",
+                               fontWeight:700, fontSize:13, fontFamily:"'DM Mono',monospace" }}>
+                  {stop.status==="delivered" ? "✓" : stop.stop_num}
+                </div>
+
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontWeight:700, fontSize:14 }}>{stop.name}</div>
+                  <div style={{ fontSize:12, color:"#6b7280", margin:"2px 0" }}>
+                    {(stop.address||"").replace(", USA","")}
+                  </div>
+                  {stop.phone && (
+                    <a href={`tel:${stop.phone}`}
+                       style={{ fontSize:12, color:"#2563eb" }}>📞 {stop.phone}</a>
+                  )}
+                  {stop.instructions && (
+                    <div style={{ marginTop:6, background:"#fffbeb", border:"1px solid #fde68a",
+                                   borderRadius:6, padding:"6px 8px", fontSize:12, color:"#92400e" }}>
+                      📋 {stop.instructions}
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ textAlign:"right", flexShrink:0 }}>
+                  <div style={{ fontFamily:"'DM Mono',monospace", fontWeight:700,
+                                 color:"#1a3a2a", fontSize:15 }}>{stop.bags}</div>
+                  <div style={{ fontSize:10, color:"#6b7280" }}>bags</div>
+                </div>
+              </div>
+
+              {stop.status === "pending" && (
+                <div style={{ marginTop:10, display:"flex", gap:8 }}>
+                  <a href={mapsUrl(stop.address)} target="_blank" rel="noreferrer"
+                     style={{ height:34, padding:"0 12px", background:"#eff6ff", color:"#2563eb",
+                              border:"1px solid #bfdbfe", borderRadius:8, fontSize:12, fontWeight:500,
+                              display:"flex", alignItems:"center", gap:4 }}>
+                    📍 Navigate
+                  </a>
+                  <button onClick={() => setActiveStop(stop.id === activeStop ? null : stop.id)}
+                    style={{ flex:1, height:34,
+                             background: stop.id===activeStop ? "#fef3c7" : "#1a6b3a",
+                             color: stop.id===activeStop ? "#92400e" : "#fff",
+                             border:"none", borderRadius:8, fontSize:12, fontWeight:600,
+                             WebkitAppearance:"none" }}>
+                    {stop.id===activeStop ? "▲ Close" : "✓ Mark Delivered"}
+                  </button>
+                </div>
+              )}
+
+              {activeStop === stop.id && stop.status === "pending" && (
+                <div style={{ marginTop:10, padding:12, background:"#f9fafb",
+                               borderRadius:8, border:"1px solid #e5e7eb" }}>
+                  <textarea
+                    placeholder="Optional note (e.g. 'Left at garage door')"
+                    value={note} onChange={e => setNote(e.target.value)}
+                    style={{ width:"100%", height:60, padding:8, border:"1px solid #e5e7eb",
+                             borderRadius:6, fontSize:12, resize:"none", outline:"none",
+                             marginBottom:8, fontFamily:"'DM Sans',sans-serif" }}
+                  />
+                  <div style={{ display:"flex", gap:8 }}>
+                    <button onClick={() => markDelivered(stop.id, "skipped")} disabled={saving}
+                      style={{ flex:1, height:36, background:"#fef2f2", color:"#dc2626",
+                               border:"1px solid #fecaca", borderRadius:8, fontSize:12, fontWeight:600 }}>
+                      Skip
+                    </button>
+                    <button onClick={() => markDelivered(stop.id, "delivered")} disabled={saving}
+                      style={{ flex:2, height:36, background:"#16a34a", color:"#fff",
+                               border:"none", borderRadius:8, fontSize:13, fontWeight:700 }}>
+                      {saving ? "Saving..." : "✓ Delivered"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {stop.status === "delivered" && (
+                <div style={{ marginTop:6, fontSize:11, color:"#16a34a", fontWeight:500 }}>
+                  ✓ Delivered{stop.driver_note ? ` — ${stop.driver_note}` : ""}
+                </div>
+              )}
+              {stop.status === "skipped" && (
+                <div style={{ marginTop:6, fontSize:11, color:"#dc2626", fontWeight:500 }}>
+                  ✗ Skipped{stop.driver_note ? ` — ${stop.driver_note}` : ""}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {stops.length > 0 && stops.every(s => s.status !== "pending") && (
+        <div style={{ margin:16, padding:20, background:"#f0fdf4", border:"2px solid #bbf7d0",
+                       borderRadius:12, textAlign:"center" }}>
+          <div style={{ fontSize:36, marginBottom:8 }}>🎉</div>
+          <div style={{ fontWeight:700, fontSize:18, color:"#15803d" }}>Route Complete!</div>
+          <div style={{ fontSize:13, color:"#16a34a", marginTop:4 }}>
+            All {stops.length} stops delivered. Great work!
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
