@@ -2658,7 +2658,7 @@ function TripLoadRow({ route, tripLabel, isNext, currentBagsInTruck, onEditBags,
               <div style={{ fontSize:28, fontWeight:800, color:"#166534", fontFamily:"'DM Mono',monospace",
                              lineHeight:1 }}>{bagsLoaded ?? "✓"}</div>
               <div style={{ fontSize:10, color:"#15803d", marginTop:2 }}>
-                {route.status === "in_progress" ? "bags remaining" : "bags"}
+                {trips.some(r => r.status === "in_progress") ? "bags remaining" : "bags"}
               </div>
             </div>
           )}
